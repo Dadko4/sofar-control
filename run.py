@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -58,6 +58,11 @@ WEB_HOST = os.environ.get("SOFAR_WEB_HOST", "127.0.0.1")
 WEB_USERNAME = os.environ.get("SOFAR_WEB_USERNAME", "")
 WEB_PASSWORD = os.environ.get("SOFAR_WEB_PASSWORD", "")
 TIMEZONE = os.environ.get("SOFAR_TIMEZONE", "Europe/Bratislava")
+BATTERY_CAPACITY_KWH = float(os.environ.get("SOFAR_BATTERY_CAPACITY_KWH", "5"))
+MAX_DISCHARGE_POWER_W = int(os.environ.get("SOFAR_MAX_DISCHARGE_POWER_W", "2500"))
+DISCHARGE_TARGET_SOC = 30
+DISCHARGE_MONITOR_INTERVAL = 10
+MODE_CONTROL_LOCK = threading.RLock()
 ALLOWED_ORIGINS = {
     origin.strip()
     for origin in os.environ.get(
@@ -70,6 +75,11 @@ WEB_ROOT = Path(__file__).parent / "web"
 REQUEST_TIMEOUT = 15
 COMMAND_TIMEOUT = 60
 SOCKET_URL = "https://eu-socket.sofarcloud.com"
+
+if not math.isfinite(BATTERY_CAPACITY_KWH) or BATTERY_CAPACITY_KWH <= 0:
+    raise ValueError("SOFAR_BATTERY_CAPACITY_KWH must be a positive number.")
+if not 100 <= MAX_DISCHARGE_POWER_W <= 2500:
+    raise ValueError("SOFAR_MAX_DISCHARGE_POWER_W must be between 100 and 2500.")
 
 LOGIN_PATH = "/api/user/auth/he/login"
 STATION_DETAIL_PATH = "/api/device/stationInfo/selectStationDetail"
@@ -143,9 +153,89 @@ def sign_sofar_request(values):
     return base64.urlsafe_b64encode(digest[:8]).decode("ascii").rstrip("=")
 
 
-def build_mode_parameters(mode, power_w=None, today=None, start_time=None, current_rules=None):
+def estimate_discharge(soc, power_w, capacity_kwh=BATTERY_CAPACITY_KWH):
+    if isinstance(soc, bool):
+        raise ValueError("Current battery SOC is unavailable.")
+    try:
+        soc = float(soc)
+    except (TypeError, ValueError):
+        raise ValueError("Current battery SOC is unavailable.") from None
+    if not math.isfinite(soc) or not DISCHARGE_TARGET_SOC < soc <= 100:
+        raise ValueError("Discharging requires a valid SOC above 30%.")
+    if isinstance(power_w, bool) or not isinstance(power_w, int) or not 100 <= power_w <= MAX_DISCHARGE_POWER_W:
+        raise ValueError(
+            f"Discharging power must be between 100 and {MAX_DISCHARGE_POWER_W} W."
+        )
+    try:
+        capacity_kwh = float(capacity_kwh)
+    except (TypeError, ValueError):
+        raise ValueError("Battery capacity must be a positive number.") from None
+    if not math.isfinite(capacity_kwh) or capacity_kwh <= 0:
+        raise ValueError("Battery capacity must be a positive number.")
+
+    energy_kwh = capacity_kwh * (soc - DISCHARGE_TARGET_SOC) / 100
+    duration_seconds = math.ceil(energy_kwh * 3_600_000 / power_w)
+    return {
+        "energy_kwh": energy_kwh,
+        "duration_seconds": duration_seconds,
+        "duration_minutes": duration_seconds / 60,
+    }
+
+
+def build_mode_parameters(
+    mode,
+    power_w=None,
+    today=None,
+    start_time=None,
+    current_rules=None,
+    end_time=None,
+):
     if mode == "self_use":
         return {"mode": "0"}
+    if mode == "grid_discharge":
+        if isinstance(power_w, bool) or not isinstance(power_w, int) or not 100 <= power_w <= MAX_DISCHARGE_POWER_W:
+            raise ValueError(
+                f"Discharging power must be between 100 and {MAX_DISCHARGE_POWER_W} W."
+            )
+        if not isinstance(current_rules, list) or len(current_rules) != 4 or not all(
+            isinstance(rule, dict) for rule in current_rules
+        ):
+            raise ValueError("Four current inverter schedule rules are required to build a discharge plan.")
+        if not isinstance(start_time, str) or not isinstance(end_time, str):
+            raise ValueError("Discharge start and end times are required.")
+        try:
+            start = datetime.strptime(start_time, "%H:%M:%S")
+            end = datetime.strptime(end_time, "%H:%M:%S")
+        except ValueError:
+            raise ValueError("Discharge times must use HH:MM:SS format.") from None
+        if end <= start:
+            raise ValueError("The discharge schedule must end later on the same day.")
+
+        rules = [dict(rule) for rule in current_rules]
+        for index, rule in enumerate(rules):
+            rule.setdefault("ruleId", str(index))
+            rule.update(
+                {
+                    "touEnable": "0",
+                    "timingChargeEnable": "0",
+                    "timingDischargeEnable": "0",
+                    "timingStartChargeTimestamp": "00:00:00",
+                    "timingEndChargeTimestamp": "23:59:59",
+                    "timingStartDischargeTimestamp": "00:00:00",
+                    "timingEndDischargeTimestamp": "23:59:59",
+                    "timingChargePower": "0",
+                    "timingDischargePower": "0",
+                }
+            )
+        rules[0].update(
+            {
+                "timingDischargeEnable": "1",
+                "timingStartDischargeTimestamp": start_time,
+                "timingEndDischargeTimestamp": end_time,
+                "timingDischargePower": str(power_w),
+            }
+        )
+        return {"mode": "2", "energyStoreRuleList": rules}
     if mode != "grid_charge":
         raise ValueError("Unsupported inverter mode.")
     if isinstance(power_w, bool) or not isinstance(power_w, int) or not 1 <= power_w <= 2000:
@@ -403,6 +493,9 @@ class SofarCloudClient:
                     return {
                         "model": COMMAND_MODEL,
                         "serial_number": INVERTER_SN,
+                        "battery_capacity_kwh": BATTERY_CAPACITY_KWH,
+                        "max_discharge_power_w": MAX_DISCHARGE_POWER_W,
+                        "discharge_target_soc": DISCHARGE_TARGET_SOC,
                         "modes": [
                             {
                                 "value": option.get("value"),
@@ -507,12 +600,17 @@ class SofarCloudClient:
             )
         schema = self.get_energy_storage_schema()
         supported_modes = {str(option["value"]) for option in schema["modes"]}
-        mode_code = "0" if mode == "self_use" else "1" if mode == "grid_charge" else ""
+        mode_code = {
+            "self_use": "0",
+            "grid_charge": "1",
+            "grid_discharge": "2",
+        }.get(mode, "")
         if mode_code not in supported_modes:
             raise SofarCloudError(
                 "The live inverter schema does not support the requested mode.",
                 "mode control",
             )
+        discharge_plan = None
         if mode == "grid_charge":
             required_fields = {
                 "touEnable",
@@ -548,6 +646,48 @@ class SofarCloudClient:
                     "Battery SOC is already at or above the 95% charge target.",
                     "mode control",
                 )
+        elif mode == "grid_discharge":
+            required_fields = {
+                "timingChargeEnable",
+                "timingDischargeEnable",
+                "timingStartChargeTimestamp",
+                "timingEndChargeTimestamp",
+                "timingStartDischargeTimestamp",
+                "timingEndDischargeTimestamp",
+                "timingChargePower",
+                "timingDischargePower",
+            }
+            if not required_fields.issubset(schema["fields"]):
+                raise SofarCloudError(
+                    "The live inverter schema is missing required Timing discharge fields.",
+                    "mode control",
+                )
+            status = self.get_status()
+            state_of_charge = status["metrics"]["battery_soc"]
+            try:
+                discharge_plan = estimate_discharge(state_of_charge, power_w)
+            except ValueError as error:
+                raise SofarCloudError(str(error), "mode control") from None
+            try:
+                start_at = datetime.now(ZoneInfo(TIMEZONE)).replace(microsecond=0)
+            except ZoneInfoNotFoundError:
+                raise SofarCloudError(
+                    f"Unknown SOFAR_TIMEZONE: {TIMEZONE}",
+                    "configuration",
+                ) from None
+            deadline = start_at + timedelta(seconds=discharge_plan["duration_seconds"])
+            if deadline.date() != start_at.date():
+                raise SofarCloudError(
+                    "The estimated discharge would cross midnight; increase the power or try earlier.",
+                    "mode control",
+                )
+            discharge_plan.update(
+                {
+                    "start_soc": float(state_of_charge),
+                    "start_at": start_at,
+                    "deadline": deadline,
+                }
+            )
 
         current_mode_state = self.read_energy_storage_mode()
         current_mode = str(current_mode_state.get("mode", ""))
@@ -569,6 +709,25 @@ class SofarCloudClient:
                 params = build_mode_parameters(
                     mode,
                     power_w,
+                    current_rules=current_rules,
+                )
+            except ValueError as error:
+                raise SofarCloudError(str(error), "mode control") from None
+        elif mode == "grid_discharge":
+            current_rules = current_mode_state.get("energyStoreRuleList")
+            if not isinstance(current_rules, list) or len(current_rules) != 4 or not all(
+                isinstance(rule, dict) for rule in current_rules
+            ):
+                raise SofarCloudError(
+                    "The inverter did not return four current schedule rules; the discharge request was not sent.",
+                    "mode control",
+                )
+            try:
+                params = build_mode_parameters(
+                    mode,
+                    power_w,
+                    start_time=discharge_plan["start_at"].strftime("%H:%M:%S"),
+                    end_time=discharge_plan["deadline"].strftime("%H:%M:%S"),
                     current_rules=current_rules,
                 )
             except ValueError as error:
@@ -639,7 +798,16 @@ class SofarCloudClient:
                 "mode verification",
                 api_code="schedule_mismatch",
             )
-        return {
+        if mode == "grid_discharge" and not self._discharge_schedule_matches(
+            verified_state.get("energyStoreRuleList"),
+            params["energyStoreRuleList"],
+        ):
+            raise SofarCloudError(
+                "SofarCloud acknowledged Timing mode, but the requested discharge schedule was not applied.",
+                "mode verification",
+                api_code="schedule_mismatch",
+            )
+        result = {
             "mode": mode_code,
             "power_w": power_w if mode == "grid_charge" else None,
             "target_soc": 95 if mode == "grid_charge" else None,
@@ -649,6 +817,20 @@ class SofarCloudClient:
             "verified": True,
             "changed": True,
         }
+        if mode == "grid_discharge":
+            result.update(
+                {
+                    "power_w": power_w,
+                    "target_soc": DISCHARGE_TARGET_SOC,
+                    "start_soc": discharge_plan["start_soc"],
+                    "estimated_energy_kwh": round(discharge_plan["energy_kwh"], 3),
+                    "estimated_duration_minutes": round(
+                        discharge_plan["duration_minutes"], 1
+                    ),
+                    "deadline": discharge_plan["deadline"].isoformat(),
+                }
+            )
+        return result
 
     @staticmethod
     def _charge_schedule_matches(actual_rules, expected_rules):
@@ -675,7 +857,159 @@ class SofarCloudClient:
                 return False
         return True
 
+    @staticmethod
+    def _discharge_schedule_matches(actual_rules, expected_rules):
+        if not isinstance(actual_rules, list) or len(actual_rules) != 4:
+            return False
+        fields = (
+            "timingChargeEnable",
+            "timingDischargeEnable",
+            "timingStartDischargeTimestamp",
+            "timingEndDischargeTimestamp",
+            "timingDischargePower",
+        )
+        for index, (actual, expected) in enumerate(zip(actual_rules, expected_rules)):
+            if not isinstance(actual, dict):
+                return False
+            if any(
+                str(actual.get(field, "")) != str(expected.get(field, ""))
+                for field in fields
+            ):
+                return False
+            if index > 0 and str(actual.get("timingDischargeEnable", "")) != "0":
+                return False
+        return True
 
+
+class DischargeWatchdog:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._state = {"active": False, "status": "idle"}
+
+    def get_state(self):
+        with self._lock:
+            return dict(self._state)
+
+    def start(self, client, plan):
+        with self._lock:
+            if self._state["active"]:
+                raise RuntimeError("A discharge monitor is already active.")
+            self._stop_event = threading.Event()
+            self._state = {
+                "active": True,
+                "status": "monitoring",
+                "target_soc": DISCHARGE_TARGET_SOC,
+                "power_w": plan["power_w"],
+                "start_soc": plan["start_soc"],
+                "last_soc": plan["start_soc"],
+                "estimated_energy_kwh": plan["estimated_energy_kwh"],
+                "estimated_duration_minutes": plan["estimated_duration_minutes"],
+                "deadline": plan["deadline"],
+                "message": "Server-side SOC monitoring is active.",
+            }
+            thread = threading.Thread(
+                target=self._monitor,
+                args=(client, plan["deadline"], self._stop_event),
+                name="sofar-discharge-watchdog",
+                daemon=True,
+            )
+            try:
+                thread.start()
+            except RuntimeError:
+                self._state = {
+                    "active": False,
+                    "status": "error",
+                    "message": "The discharge monitor thread could not be started.",
+                }
+                raise
+
+    def stop(self, reason="operator_changed_mode"):
+        self._stop_event.set()
+        with self._lock:
+            self._state.update(
+                {
+                    "active": False,
+                    "status": "stopped",
+                    "stop_reason": reason,
+                    "message": "Discharge monitoring stopped after an inverter mode change.",
+                }
+            )
+
+    def _monitor(self, client, deadline, stop_event):
+        while not stop_event.is_set():
+            try:
+                remaining = (
+                    datetime.fromisoformat(deadline)
+                    - datetime.now(ZoneInfo(TIMEZONE))
+                ).total_seconds()
+            except (ValueError, ZoneInfoNotFoundError) as error:
+                LOGGER.error("Discharge monitor could not evaluate its deadline: %s", error)
+                if self._request_self_use(client, "invalid_deadline", stop_event):
+                    return
+                stop_event.wait(DISCHARGE_MONITOR_INTERVAL)
+                continue
+
+            reason = None
+            soc = None
+            if remaining <= 0:
+                reason = "estimated_time_limit"
+            else:
+                try:
+                    status = client.get_status()
+                    soc = float(status["metrics"]["battery_soc"])
+                    if not math.isfinite(soc) or not 0 <= soc <= 100:
+                        raise ValueError("SOC is outside the valid range.")
+                except (SofarCloudError, KeyError, TypeError, ValueError) as error:
+                    LOGGER.error("Discharge SOC read failed; requesting Self-use: %s", error)
+                    reason = "telemetry_unavailable"
+                if soc is not None:
+                    with self._lock:
+                        self._state.update(
+                            {
+                                "last_soc": soc,
+                                "status": "monitoring",
+                                "message": "Server-side SOC monitoring is active.",
+                            }
+                        )
+                    if soc <= DISCHARGE_TARGET_SOC:
+                        reason = "target_soc_reached"
+
+            if reason and self._request_self_use(client, reason, stop_event):
+                return
+            stop_event.wait(
+                min(DISCHARGE_MONITOR_INTERVAL, max(1, remaining))
+                if remaining > 0
+                else DISCHARGE_MONITOR_INTERVAL
+            )
+
+    def _request_self_use(self, client, reason, stop_event):
+        with self._lock:
+            self._state.update(
+                {
+                    "status": "returning_to_self_use",
+                    "message": f"Returning to Self-use ({reason}).",
+                }
+            )
+        try:
+            with MODE_CONTROL_LOCK:
+                if stop_event.is_set():
+                    return True
+                client.set_energy_storage_mode("self_use", confirmed=True)
+        except SofarCloudError as error:
+            LOGGER.error(
+                "Could not return the inverter to Self-use after %s (stage=%s, API code=%s)",
+                reason,
+                error.stage,
+                error.api_code,
+            )
+            return False
+        self.stop(reason)
+        LOGGER.info("Discharge stopped; inverter returned to Self-use (%s).", reason)
+        return True
+
+
+DISCHARGE_WATCHDOG = DischargeWatchdog()
 CLIENT = SofarCloudClient(USERNAME, PASSWORD, PLANT_ID, model=INVERTER_MODEL)
 
 
@@ -693,6 +1027,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_capabilities()
         elif self.path == "/api/mode":
             self._send_mode()
+        elif self.path == "/api/discharge-status":
+            self._send_json(200, DISCHARGE_WATCHDOG.get_state())
         else:
             self.send_error(404)
 
@@ -728,18 +1064,56 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if payload.get("confirmed") is not True:
             self._send_json(400, {"error": "Confirm the mode change before sending it."})
             return
-        try:
-            result = CLIENT.set_energy_storage_mode(
-                payload.get("mode"),
-                payload.get("power_w"),
-                confirmed=payload.get("confirmed") is True,
-            )
-            self._send_json(200, result)
-        except ValueError as error:
-            self._send_json(400, {"error": str(error), "stage": "validation"})
-        except SofarCloudError as error:
-            LOGGER.warning("Mode control failed at %s (API code=%s)", error.stage, error.api_code)
-            self._send_json(502, error.as_dict())
+        with MODE_CONTROL_LOCK:
+            if payload.get("mode") == "grid_discharge" and DISCHARGE_WATCHDOG.get_state()["active"]:
+                self._send_json(409, {"error": "A discharge plan is already being monitored."})
+                return
+            try:
+                result = CLIENT.set_energy_storage_mode(
+                    payload.get("mode"),
+                    payload.get("power_w"),
+                    confirmed=payload.get("confirmed") is True,
+                )
+                if payload.get("mode") == "grid_discharge":
+                    try:
+                        DISCHARGE_WATCHDOG.start(CLIENT, result)
+                    except RuntimeError as error:
+                        LOGGER.error("Discharge monitor could not start: %s", error)
+                        try:
+                            CLIENT.set_energy_storage_mode("self_use", confirmed=True)
+                        except SofarCloudError as fallback_error:
+                            LOGGER.critical(
+                                "Discharge monitor failed and the inverter could not be returned to Self-use "
+                                "(stage=%s, API code=%s)",
+                                fallback_error.stage,
+                                fallback_error.api_code,
+                            )
+                            self._send_json(
+                                502,
+                                {
+                                    "error": "The discharge monitor failed to start and the inverter may still be discharging.",
+                                    "stage": "discharge monitor",
+                                },
+                            )
+                        else:
+                            self._send_json(
+                                503,
+                                {
+                                    "error": "The discharge monitor failed to start; the inverter was returned to Self-use.",
+                                    "stage": "discharge monitor",
+                                },
+                            )
+                        return
+                else:
+                    DISCHARGE_WATCHDOG.stop()
+                self._send_json(200, result)
+            except RuntimeError as error:
+                self._send_json(409, {"error": str(error), "stage": "discharge monitor"})
+            except ValueError as error:
+                self._send_json(400, {"error": str(error), "stage": "validation"})
+            except SofarCloudError as error:
+                LOGGER.warning("Mode control failed at %s (API code=%s)", error.stage, error.api_code)
+                self._send_json(502, error.as_dict())
 
     def _is_authorized(self):
         if not WEB_USERNAME and not WEB_PASSWORD:
@@ -795,6 +1169,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except SofarCloudError as error:
             LOGGER.warning("Mode read failed at %s (API code=%s)", error.stage, error.api_code)
             self._send_json(503, error.as_dict())
+
+    def _send_discharge_status(self):
+        self._send_discharge_status()
 
     def _send_file(self, path, content_type):
         try:

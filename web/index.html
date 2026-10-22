@@ -40,6 +40,7 @@
       background: #101b27; color: #ecf3f8; font: inherit; }
     input[type="range"] { width: min(100%, 360px); }
     .hint { margin: 14px 0 0; font-size: .9rem; line-height: 1.5; }
+    .estimate { margin: 4px 0 0; color: #c5d4de; font-size: .9rem; }
     .controls button:disabled { cursor: not-allowed; opacity: .55; }
     .updated { margin-top: 24px; font-size: .9rem; }
     .error { color: #ffb4a8; }
@@ -77,6 +78,7 @@
         <select id="requested-mode">
           <option value="self_use">Self-use — menič riadi batériu</option>
           <option value="grid_charge">Nabíjať do 95 % — iba dnes</option>
+          <option value="grid_discharge" disabled>Vybíjať do 30 % — iba dnes</option>
         </select>
         <button id="apply-mode" type="button" disabled>Nastaviť režim</button>
       </div>
@@ -85,6 +87,13 @@
         <input id="charge-power" type="range" min="100" max="2000" step="100" value="2000">
         <strong><span id="charge-power-value">2000</span> W</strong>
       </div>
+      <div class="control-row" id="discharge-power-row" hidden>
+        <label for="discharge-power">Limit vybíjania</label>
+        <input id="discharge-power" type="range" min="100" max="2500" step="100" value="2500">
+        <strong><span id="discharge-power-value">2500</span> W</strong>
+      </div>
+      <p class="estimate" id="discharge-estimate" hidden></p>
+      <p class="estimate" id="discharge-watchdog-status" role="status" hidden></p>
       <p class="hint" id="control-hint" role="note">
         Načítavam podporu zariadenia…
       </p>
@@ -102,10 +111,13 @@
     const modeNames = {
       "0": "Self-use",
       "1": "Time-of-Use — nabíjanie do cieľového SOC",
-      "2": "Timing"
+      "2": "Timing — časový plán"
     };
     let controlReady = false;
     let currentSoc = null;
+    let dischargeReady = false;
+    let batteryCapacityKwh = 5;
+    let maxDischargePowerW = 2500;
 
     function formatValue(value, unit) {
       if (value === null || value === undefined || value === "") return "—";
@@ -140,10 +152,15 @@
         }
         document.getElementById("station").textContent = data.station_name;
         document.getElementById("model").textContent = data.model;
-        currentSoc = Number(data.metrics.battery_soc);
+        const rawSoc = data.metrics.battery_soc;
+        currentSoc = rawSoc === null || rawSoc === undefined || rawSoc === ""
+          ? null
+          : Number(rawSoc);
+        if (!Number.isFinite(currentSoc)) currentSoc = null;
         for (const [elementId, key, unit] of fields) {
           document.getElementById(elementId).textContent = formatValue(data.metrics[key], unit);
         }
+        updateDischargeEstimate();
         status.textContent = `Aktualizované: ${data.updated_at}`;
       } catch (error) {
         status.textContent = error.message;
@@ -159,16 +176,19 @@
       button.disabled = true;
       document.getElementById("current-mode").textContent = "Overujem…";
       try {
-        const [capabilityResponse, modeResponse] = await Promise.all([
+        const [capabilityResponse, modeResponse, dischargeResponse] = await Promise.all([
           fetch("/api/capabilities", { cache: "no-store" }),
-          fetch("/api/mode", { cache: "no-store" })
+          fetch("/api/mode", { cache: "no-store" }),
+          fetch("/api/discharge-status", { cache: "no-store" })
         ]);
-        const [capabilities, mode] = await Promise.all([
+        const [capabilities, mode, discharge] = await Promise.all([
           capabilityResponse.json(),
-          modeResponse.json()
+          modeResponse.json(),
+          dischargeResponse.json()
         ]);
         if (!capabilityResponse.ok) throw new Error(capabilities.error || "Nepodarilo sa načítať podporované režimy.");
         if (!modeResponse.ok) throw new Error(mode.error || "Nepodarilo sa načítať aktuálny režim.");
+        if (!dischargeResponse.ok) throw new Error(discharge.error || "Nepodarilo sa načítať stav dohľadu vybíjania.");
         const supported = new Set(capabilities.modes.map(item => String(item.value)));
         const fieldsAvailable = new Set(capabilities.fields);
         const canCharge = [
@@ -176,13 +196,34 @@
           "touStartChargeTimestamp", "touEndChargeTimestamp",
           "touStartTimestamp", "touEndTimestamp", "touEnableWeek"
         ].every(field => fieldsAvailable.has(field));
+        const canDischarge = [
+          "timingChargeEnable", "timingDischargeEnable",
+          "timingStartChargeTimestamp", "timingEndChargeTimestamp",
+          "timingStartDischargeTimestamp", "timingEndDischargeTimestamp",
+          "timingChargePower", "timingDischargePower"
+        ].every(field => fieldsAvailable.has(field));
         controlReady = supported.has("0") && supported.has("1") && canCharge;
+        dischargeReady = supported.has("2") && canDischarge;
+        batteryCapacityKwh = Number(capabilities.battery_capacity_kwh);
+        maxDischargePowerW = Number(capabilities.max_discharge_power_w);
+        if (!Number.isFinite(batteryCapacityKwh) || batteryCapacityKwh <= 0 ||
+            !Number.isFinite(maxDischargePowerW) || maxDischargePowerW < 100) {
+          throw new Error("Konfigurácia kapacity batérie alebo maximálneho výkonu vybíjania je neplatná.");
+        }
+        const dischargePower = document.getElementById("discharge-power");
+        dischargePower.max = String(maxDischargePowerW);
+        if (Number(dischargePower.value) > maxDischargePowerW) {
+          dischargePower.value = String(maxDischargePowerW);
+        }
+        document.querySelector('#requested-mode option[value="grid_discharge"]').disabled = !dischargeReady;
         const modeValue = String(mode.mode ?? "");
         document.getElementById("current-mode").textContent = modeNames[modeValue] || `Neznámy (${modeValue || "—"})`;
+        showDischargeStatus(discharge);
         hint.textContent = controlReady
-          ? "Plán nastaví začiatok na aktuálnu minútu, cieľ 95 % a limit najviac 2 kW; platí do 23:59. Prepíše existujúce pravidlá Time-of-Use. Po dnešnom pláne sa režim nemusí automaticky vrátiť na Self-use. Živá schéma meniča neuvádza samostatný prepínač zdroja zo siete ani pravidlo pre prebytok FVE, preto na meničovi over, či nabíja zo siete a posiela prebytok FVE do batérie. Vybíjanie nie je sprístupnené."
+          ? `Nabíjanie prepíše existujúce pravidlá Time-of-Use, začne okamžite a platí do 23:59; cieľ je 95 % a limit najviac 2 kW. Vybíjanie používa režim Timing a serverový dohľad s cieľom 30 %; aplikácia aj SofarCloud musia zostať dostupné. Schéma meniča nemá hardvérový SOC limit ani dátum jednorazového plánu, preto môže plán po výpadku zostať aktívny a opakovať sa. Pri prvom teste over export do siete aj smerovanie prebytku FVE. Stav dohľadu: ${discharge.active ? `aktívny, posledné SOC ${formatValue(discharge.last_soc, "%")}` : discharge.status || "neaktívny"}.`
           : "Menič aktuálne nehlási všetky potrebné polia pre bezpečné ovládanie. Príkazy sú vypnuté.";
         button.disabled = !controlReady;
+        updateDischargeEstimate();
       } catch (error) {
         controlReady = false;
         document.getElementById("current-mode").textContent = "Neznámy (neoverený)";
@@ -192,15 +233,25 @@
 
     async function applyMode() {
       const mode = document.getElementById("requested-mode").value;
-      const powerW = Number(document.getElementById("charge-power").value);
+      const powerW = Number(document.getElementById(mode === "grid_discharge" ? "discharge-power" : "charge-power").value);
       const charge = mode === "grid_charge";
+      const discharge = mode === "grid_discharge";
       if (!controlReady) return;
       if (charge && (!Number.isFinite(currentSoc) || currentSoc >= 95)) {
         showError(new Error("Nabíjanie nie je povolené: aktuálne SOC nie je známe alebo je už aspoň 95 %."));
         return;
       }
+      if (discharge && (!dischargeReady || !Number.isFinite(currentSoc) || currentSoc <= 30)) {
+        showError(new Error("Vybíjanie nie je povolené: vyžaduje sa dostupné SOC nad 30 % a podporovaný Timing režim."));
+        return;
+      }
+      const capacity = batteryCapacityKwh;
+      const energy = discharge ? capacity * (currentSoc - 30) / 100 : 0;
+      const minutes = discharge ? energy / (powerW / 1000) * 60 : 0;
       const summary = charge
         ? `Nastaviť nabíjací plán od aktuálnej minúty do 23:59, cieľ 95 % a najviac ${powerW} W? Existujúci plán Time-of-Use sa prepíše.`
+        : discharge
+          ? `Vybíjať pri limite najviac ${powerW} W a serverovo sledovať SOC do 30 %? Odhad: ${energy.toFixed(2)} kWh a ${minutes.toFixed(0)} min. Menič nemá hardvérový SOC limit; aplikácia a SofarCloud musia zostať dostupné. Ak časový plán zostane po výpadku aktívny, môže sa zopakovať.`
         : "Vrátiť menič do režimu Self-use?";
       if (!window.confirm(`${summary}\n\nPríkaz sa odošle do meniča cez SofarCloud.`)) return;
 
@@ -225,6 +276,8 @@
           ? "Menič už je v režime Self-use; príkaz sa neodoslal."
           : result.mode === "1"
             ? "Menič potvrdil Time-of-Use aj nabíjací plán pri spätnom čítaní."
+          : result.mode === "2"
+            ? `Menič potvrdil Timing plán. Server sleduje SOC ${result.start_soc} % → ${result.target_soc} %; záložný koniec ${result.deadline}.`
           : "SofarCloud potvrdil príkaz a aktuálny režim bol overený.";
       } catch (error) {
         showError(error);
@@ -237,15 +290,60 @@
 
     document.getElementById("requested-mode").addEventListener("change", event => {
       document.getElementById("charge-power-row").hidden = event.target.value !== "grid_charge";
+      const discharge = event.target.value === "grid_discharge";
+      document.getElementById("discharge-power-row").hidden = !discharge;
+      document.getElementById("discharge-estimate").hidden = !discharge;
+      updateDischargeEstimate();
     });
     document.getElementById("charge-power").addEventListener("input", event => {
       document.getElementById("charge-power-value").textContent = event.target.value;
     });
+    document.getElementById("discharge-power").addEventListener("input", event => {
+      document.getElementById("discharge-power-value").textContent = event.target.value;
+      updateDischargeEstimate();
+    });
     document.getElementById("refresh").addEventListener("click", refresh);
     document.getElementById("apply-mode").addEventListener("click", applyMode);
+
+    function updateDischargeEstimate() {
+      const element = document.getElementById("discharge-estimate");
+      const power = Number(document.getElementById("discharge-power").value);
+      if (!Number.isFinite(currentSoc) || currentSoc <= 30 || !Number.isFinite(power) || power <= 0) {
+        element.textContent = "Odhad bude dostupný pri známej úrovni SOC nad 30 %.";
+        return;
+      }
+      const energy = batteryCapacityKwh * (currentSoc - 30) / 100;
+      const minutes = energy / (power / 1000) * 60;
+      element.textContent = `Odhad do 30 %: ${energy.toLocaleString("sk-SK", { maximumFractionDigits: 2 })} kWh, približne ${minutes.toLocaleString("sk-SK", { maximumFractionDigits: 0 })} min pri ${power} W.`;
+    }
+
+    function showDischargeStatus(discharge) {
+      const element = document.getElementById("discharge-watchdog-status");
+      element.hidden = !discharge.active;
+      element.classList.remove("error");
+      if (discharge.active) {
+        element.textContent = `Aktívny dohľad: SOC ${formatValue(discharge.last_soc, "%")}, cieľ ${discharge.target_soc} %, limit ${discharge.power_w} W. ${discharge.message}`;
+      }
+    }
+
+    async function refreshDischargeStatus() {
+      const element = document.getElementById("discharge-watchdog-status");
+      try {
+        const response = await fetch("/api/discharge-status", { cache: "no-store" });
+        const discharge = await response.json();
+        if (!response.ok) throw new Error(discharge.error || `Chyba HTTP ${response.status}`);
+        showDischargeStatus(discharge);
+      } catch (error) {
+        element.hidden = false;
+        element.textContent = `Stav dohľadu vybíjania sa nedá načítať: ${error.message}`;
+        element.classList.add("error");
+      }
+    }
+
     refresh();
     loadControls();
     window.setInterval(refresh, 60_000);
+    window.setInterval(refreshDischargeStatus, 10_000);
   </script>
 </body>
 </html>

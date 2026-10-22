@@ -6,11 +6,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.request import addinfourl
 from unittest.mock import MagicMock, patch
+from datetime import datetime, timedelta
+from threading import Event
+from zoneinfo import ZoneInfo
 
 from run import (
+    TIMEZONE,
+    DischargeWatchdog,
     SofarCloudClient,
     SofarCloudError,
     build_mode_parameters,
+    estimate_discharge,
     load_env_file,
     parse_station_status,
     sign_sofar_request,
@@ -234,6 +240,53 @@ class SofarCloudClientTests(unittest.TestCase):
                         current_rules=rules,
                     )
 
+    def test_discharge_estimate_uses_configured_capacity_and_soc_floor(self):
+        estimate = estimate_discharge(73, 2500, 5)
+
+        self.assertEqual(estimate["energy_kwh"], 2.15)
+        self.assertEqual(estimate["duration_seconds"], 3096)
+        self.assertEqual(estimate["duration_minutes"], 51.6)
+
+    def test_discharge_estimate_rejects_soc_at_floor_and_invalid_power(self):
+        for soc, power in ((30, 2500), (float("nan"), 2500), (73, 2501), (73, 99)):
+            with self.subTest(soc=soc, power=power):
+                with self.assertRaises(ValueError):
+                    estimate_discharge(soc, power, 5)
+
+    def test_discharge_mode_parameters_enable_one_rule_and_disable_others(self):
+        params = build_mode_parameters(
+            "grid_discharge",
+            2500,
+            start_time="12:00:00",
+            end_time="12:51:36",
+            current_rules=sample_tou_rules(),
+        )
+
+        self.assertEqual(params["mode"], "2")
+        rules = params["energyStoreRuleList"]
+        self.assertEqual(len(rules), 4)
+        self.assertEqual(rules[0]["touEnable"], "0")
+        self.assertEqual(rules[0]["timingChargeEnable"], "0")
+        self.assertEqual(rules[0]["timingDischargeEnable"], "1")
+        self.assertEqual(rules[0]["timingStartDischargeTimestamp"], "12:00:00")
+        self.assertEqual(rules[0]["timingEndDischargeTimestamp"], "12:51:36")
+        self.assertEqual(rules[0]["timingDischargePower"], "2500")
+        self.assertEqual(
+            [rule["timingDischargeEnable"] for rule in rules[1:]],
+            ["0", "0", "0"],
+        )
+        self.assertEqual([rule["touEnable"] for rule in rules], ["0", "0", "0", "0"])
+
+    def test_discharge_mode_parameters_reject_schedule_crossing_midnight(self):
+        with self.assertRaisesRegex(ValueError, "end later on the same day"):
+            build_mode_parameters(
+                "grid_discharge",
+                2500,
+                start_time="23:30:00",
+                end_time="00:10:00",
+                current_rules=sample_tou_rules(),
+            )
+
     def test_request_sign_uses_only_scalar_fields(self):
         self.assertEqual(
             sign_sofar_request({"a": "value", "nested": {"secret": "excluded"}}),
@@ -422,6 +475,141 @@ class SofarCloudClientTests(unittest.TestCase):
                 client.set_energy_storage_mode("grid_charge", 2000, confirmed=True)
 
         self.assertEqual(raised.exception.stage, "mode verification")
+
+    def test_discharge_is_blocked_at_or_below_the_soc_floor_before_any_write(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        schema = {
+            "modes": [{"value": "0"}, {"value": "1"}, {"value": "2"}],
+            "fields": [
+                "timingChargeEnable",
+                "timingDischargeEnable",
+                "timingStartChargeTimestamp",
+                "timingEndChargeTimestamp",
+                "timingStartDischargeTimestamp",
+                "timingEndDischargeTimestamp",
+                "timingChargePower",
+                "timingDischargePower",
+            ],
+        }
+        with patch.object(client, "get_energy_storage_schema", return_value=schema), \
+                patch.object(
+                    client,
+                    "get_status",
+                    return_value={"metrics": {"battery_soc": 30}},
+                ), \
+                patch.object(client, "read_energy_storage_mode") as read_mode, \
+                patch.object(client, "_execute_command") as command:
+            with self.assertRaisesRegex(SofarCloudError, "above 30%"):
+                client.set_energy_storage_mode(
+                    "grid_discharge",
+                    2500,
+                    confirmed=True,
+                )
+
+        read_mode.assert_not_called()
+        command.assert_not_called()
+
+    def test_discharge_sends_and_verifies_bounded_timing_schedule(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        client._access_token = "test-token"
+        client._token_expires_at = 9999999999
+        original_rules = sample_tou_rules()
+        schema = {
+            "modes": [{"value": "0"}, {"value": "1"}, {"value": "2"}],
+            "fields": [
+                "timingChargeEnable",
+                "timingDischargeEnable",
+                "timingStartChargeTimestamp",
+                "timingEndChargeTimestamp",
+                "timingStartDischargeTimestamp",
+                "timingEndDischargeTimestamp",
+                "timingChargePower",
+                "timingDischargePower",
+            ],
+        }
+        socket_client = MagicMock()
+        socket_client.connected = True
+        command = MagicMock(return_value={"result": 1})
+        mode_reads = []
+
+        def read_mode():
+            if not mode_reads:
+                mode_reads.append(True)
+                return {"mode": "1", "energyStoreRuleList": original_rules}
+            updated_rules = command.call_args.args[0]["updateValue"]["energyStoreRuleList"]
+            return {"mode": "2", "energyStoreRuleList": updated_rules}
+
+        with patch.object(client, "get_energy_storage_schema", return_value=schema), \
+                patch.object(
+                    client,
+                    "get_status",
+                    return_value={"metrics": {"battery_soc": 73}},
+                ), \
+                patch.object(client, "read_energy_storage_mode", side_effect=read_mode), \
+                patch("run.socketio.Client", return_value=socket_client), \
+                patch.object(client, "_execute_command", command):
+            result = client.set_energy_storage_mode(
+                "grid_discharge",
+                2500,
+                confirmed=True,
+            )
+
+        params = command.call_args.args[0]["params"]
+        self.assertEqual(params["mode"], "2")
+        self.assertEqual(params["energyStoreRuleList"][0]["timingDischargeEnable"], "1")
+        self.assertEqual(params["energyStoreRuleList"][0]["timingDischargePower"], "2500")
+        self.assertEqual(
+            [rule["timingDischargeEnable"] for rule in params["energyStoreRuleList"][1:]],
+            ["0", "0", "0"],
+        )
+        self.assertEqual(result["target_soc"], 30)
+        self.assertEqual(result["start_soc"], 73)
+        self.assertEqual(result["estimated_energy_kwh"], 2.15)
+        self.assertEqual(result["estimated_duration_minutes"], 51.6)
+        self.assertTrue(result["verified"])
+        socket_client.connect.assert_called_once()
+        socket_client.disconnect.assert_called_once()
+
+    def test_discharge_watchdog_returns_to_self_use_at_soc_floor(self):
+        watchdog = DischargeWatchdog()
+        client = MagicMock()
+        client.get_status.return_value = {"metrics": {"battery_soc": 30}}
+        deadline = (
+            datetime.now(ZoneInfo(TIMEZONE)) + timedelta(minutes=5)
+        ).isoformat()
+
+        watchdog._monitor(client, deadline, Event())
+
+        client.set_energy_storage_mode.assert_called_once_with(
+            "self_use",
+            confirmed=True,
+        )
+        state = watchdog.get_state()
+        self.assertFalse(state["active"])
+        self.assertEqual(state["status"], "stopped")
+        self.assertEqual(state["stop_reason"], "target_soc_reached")
+
+    def test_discharge_watchdog_fails_closed_when_soc_cannot_be_read(self):
+        watchdog = DischargeWatchdog()
+        client = MagicMock()
+        client.get_status.side_effect = SofarCloudError(
+            "Telemetry unavailable.",
+            "station detail",
+        )
+        deadline = (
+            datetime.now(ZoneInfo(TIMEZONE)) + timedelta(minutes=5)
+        ).isoformat()
+
+        watchdog._monitor(client, deadline, Event())
+
+        client.set_energy_storage_mode.assert_called_once_with(
+            "self_use",
+            confirmed=True,
+        )
+        self.assertEqual(
+            watchdog.get_state()["stop_reason"],
+            "telemetry_unavailable",
+        )
 
 
 class DashboardAuthenticationTests(unittest.TestCase):

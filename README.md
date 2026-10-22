@@ -29,12 +29,27 @@ najprv ho zmeň v SofarCloud.
 Ak treba zmeniť port, nastav `SOFAR_WEB_PORT`. Región API možno zmeniť cez
 `SOFAR_BASE_URL`, predvolene sa používa `https://eu.sofarcloud.com`.
 Časové plány používajú `SOFAR_TIMEZONE` (predvolene `Europe/Bratislava`).
+Kapacitu batérie a horný limit vybíjacieho výkonu nastav cez
+`SOFAR_BATTERY_CAPACITY_KWH` (predvolene 5 kWh) a
+`SOFAR_MAX_DISCHARGE_POWER_W` (predvolene 2 500 W, povolený rozsah 100–2 500 W).
 
 Rozhranie ponúka Self-use a časovo obmedzené nabíjanie do 95 % s nastaviteľným
 výkonom najviac 2 kW. Nabíjací plán začne od aktuálnej minúty a platí do 23:59
 aktuálneho dňa. Prepíše existujúce pravidlá Time-of-Use a ponechá aktívne iba
 nové pravidlo; po skončení plánu sa režim nemusí sám vrátiť na Self-use, preto
-ho skontroluj a prípadne prepnúť späť manuálne. Vybíjanie nie je sprístupnené.
+ho skontroluj a prípadne prepnúť späť manuálne.
+
+Vybíjanie používa režim Timing, nastaviteľný výkon do 2 500 W a cieľ 30 % SOC.
+Odhad času a energie vychádza z nastavenej kapacity batérie. Server kontroluje
+SOC každých 10 sekúnd a pri dosiahnutí 30 % sa pokúsi prepnúť menič na Self-use.
+Časový plán má aj koniec vypočítaný z odhadovanej energie ako záložný limit.
+Ak server alebo SofarCloud nie sú dostupné, tento dohľad nemusí vedieť zastaviť
+menič; po výpadku môže Timing plán zostať aktívny a zopakovať sa. Nechaj
+aplikáciu aj spojenie so SofarCloud dostupné počas celého vybíjania a po teste
+over režim meniča. Schéma zariadenia neposkytuje hardvérový minimálny SOC, takže
+softvérové zastavenie nezaručuje, že SOC nikdy neklesne mierne pod 30 %.
+Smerovanie prebytku FVE do siete a skutočné vybíjanie do siete treba pri prvom
+teste overiť priamo na zariadení.
 
 Pred každým príkazom sa zobrazí potvrdenie; nabíjanie sa odmietne, ak aktuálne
 SOC nie je dostupné alebo je aspoň 95 %. Plán sa pri čítaní späť overí vrátane
