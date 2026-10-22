@@ -67,7 +67,8 @@
       <article class="card"><div class="label">Výroba FVE</div><div class="value" id="generation">—</div></article>
       <article class="card"><div class="label">Spotreba domu</div><div class="value" id="consumption">—</div></article>
       <article class="card"><div class="label">Stav batérie</div><div class="value" id="soc">—</div></article>
-      <article class="card"><div class="label">Výkon batérie</div><div class="value" id="battery">—</div></article>
+      <article class="card"><div class="label">Nabíjanie batérie</div><div class="value" id="charge">—</div></article>
+      <article class="card"><div class="label">Vybíjanie batérie</div><div class="value" id="discharge">—</div></article>
       <article class="card"><div class="label">Výkon siete</div><div class="value" id="grid">—</div></article>
     </section>
     <section class="controls" aria-labelledby="controls-title">
@@ -78,7 +79,7 @@
         <select id="requested-mode">
           <option value="self_use">Self-use — menič riadi batériu</option>
           <option value="grid_charge">Nabíjať do 95 % — iba dnes</option>
-          <option value="grid_discharge" disabled>Vybíjať do 30 % — iba dnes</option>
+          <option value="grid_discharge" disabled>Passive — vybíjať do siete (experimentálne)</option>
         </select>
         <button id="apply-mode" type="button" disabled>Nastaviť režim</button>
       </div>
@@ -105,13 +106,15 @@
       ["generation", "generation_power", "kW"],
       ["consumption", "use_power", "kW"],
       ["soc", "battery_soc", "%"],
-      ["battery", "battery_power", "kW"],
+      ["charge", "charge_power", "kW", true],
+      ["discharge", "discharge_power", "kW", true],
       ["grid", "grid_power", "kW"]
     ];
     const modeNames = {
       "0": "Self-use",
       "1": "Time-of-Use — nabíjanie do cieľového SOC",
-      "2": "Timing — časový plán"
+      "2": "Timing — časový plán",
+      "3": "Passive — vzdialené riadenie výkonu"
     };
     let controlReady = false;
     let currentSoc = null;
@@ -119,11 +122,21 @@
     let batteryCapacityKwh = 5;
     let maxDischargePowerW = 2500;
 
-    function formatValue(value, unit) {
+    function formatValue(value, unit, absolute = false) {
       if (value === null || value === undefined || value === "") return "—";
       const number = Number(value);
-      const text = Number.isFinite(number) ? number.toLocaleString("sk-SK", { maximumFractionDigits: 2 }) : String(value);
+      const displayNumber = absolute ? Math.abs(number) : number;
+      const text = Number.isFinite(displayNumber) ? displayNumber.toLocaleString("sk-SK", { maximumFractionDigits: 2 }) : String(value);
       return `${text} ${unit}`;
+    }
+
+    function formatTelemetryTime(value) {
+      const timestamp = Number(value);
+      if (!Number.isFinite(timestamp) || timestamp <= 0) return "čas merania neznámy";
+      const date = new Date(timestamp * 1000);
+      return Number.isNaN(date.getTime())
+        ? "čas merania neznámy"
+        : date.toLocaleString("sk-SK");
     }
 
     function showError(error) {
@@ -157,11 +170,11 @@
           ? null
           : Number(rawSoc);
         if (!Number.isFinite(currentSoc)) currentSoc = null;
-        for (const [elementId, key, unit] of fields) {
-          document.getElementById(elementId).textContent = formatValue(data.metrics[key], unit);
+        for (const [elementId, key, unit, absolute] of fields) {
+          document.getElementById(elementId).textContent = formatValue(data.metrics[key], unit, absolute);
         }
         updateDischargeEstimate();
-        status.textContent = `Aktualizované: ${data.updated_at}`;
+        status.textContent = `Dáta meniča: ${formatTelemetryTime(data.data_time)} · načítané: ${data.updated_at}`;
       } catch (error) {
         status.textContent = error.message;
         status.classList.add("error");
@@ -197,13 +210,10 @@
           "touStartTimestamp", "touEndTimestamp", "touEnableWeek"
         ].every(field => fieldsAvailable.has(field));
         const canDischarge = [
-          "timingChargeEnable", "timingDischargeEnable",
-          "timingStartChargeTimestamp", "timingEndChargeTimestamp",
-          "timingStartDischargeTimestamp", "timingEndDischargeTimestamp",
-          "timingChargePower", "timingDischargePower"
+          "passiveManualBup", "passiveManualBlo"
         ].every(field => fieldsAvailable.has(field));
         controlReady = supported.has("0") && supported.has("1") && canCharge;
-        dischargeReady = supported.has("2") && canDischarge;
+        dischargeReady = capabilities.passive_discharge_enabled === true && canDischarge;
         batteryCapacityKwh = Number(capabilities.battery_capacity_kwh);
         maxDischargePowerW = Number(capabilities.max_discharge_power_w);
         if (!Number.isFinite(batteryCapacityKwh) || batteryCapacityKwh <= 0 ||
@@ -220,7 +230,7 @@
         document.getElementById("current-mode").textContent = modeNames[modeValue] || `Neznámy (${modeValue || "—"})`;
         showDischargeStatus(discharge);
         hint.textContent = controlReady
-          ? `Nabíjanie prepíše existujúce pravidlá Time-of-Use, začne okamžite a platí do 23:59; cieľ je 95 % a limit najviac 2 kW. Vybíjanie používa režim Timing a serverový dohľad s cieľom 30 %; aplikácia aj SofarCloud musia zostať dostupné. Schéma meniča nemá hardvérový SOC limit ani dátum jednorazového plánu, preto môže plán po výpadku zostať aktívny a opakovať sa. Pri prvom teste over export do siete aj smerovanie prebytku FVE. Stav dohľadu: ${discharge.active ? `aktívny, posledné SOC ${formatValue(discharge.last_soc, "%")}` : discharge.status || "neaktívny"}.`
+          ? `Nabíjanie prepíše existujúce pravidlá Time-of-Use, začne okamžite a platí do 23:59; cieľ je 95 % a limit najviac 2 kW. Passive vybíjanie používa záporný výkonový povel a serverový dohľad s cieľom 30 %. Export do siete bol potvrdený pri krátkom 500 W teste; hardvérový SOC limit treba overiť v nastaveniach meniča. Aplikácia aj SofarCloud musia zostať dostupné. Telemetria môže meškať, preto kontroluj čas merania zo zariadenia. Passive dostupnosť: ${capabilities.passive_discharge_enabled ? "povolená" : capabilities.passive_discharge_supported ? "vypnutá bezpečnostným nastavením SOFAR_ENABLE_PASSIVE_DISCHARGE" : "nepodporovaná schémou/modelom"}. Stav dohľadu: ${discharge.active ? `aktívny, posledné SOC ${formatValue(discharge.last_soc, "%")}` : discharge.status || "neaktívny"}.`
           : "Menič aktuálne nehlási všetky potrebné polia pre bezpečné ovládanie. Príkazy sú vypnuté.";
         button.disabled = !controlReady;
         updateDischargeEstimate();
@@ -242,7 +252,7 @@
         return;
       }
       if (discharge && (!dischargeReady || !Number.isFinite(currentSoc) || currentSoc <= 30)) {
-        showError(new Error("Vybíjanie nie je povolené: vyžaduje sa dostupné SOC nad 30 % a podporovaný Timing režim."));
+        showError(new Error("Vybíjanie nie je povolené: vyžaduje sa Passive režim, jeho bezpečnostné povolenie a dostupné SOC nad 30 %."));
         return;
       }
       const capacity = batteryCapacityKwh;
@@ -251,7 +261,7 @@
       const summary = charge
         ? `Nastaviť nabíjací plán od aktuálnej minúty do 23:59, cieľ 95 % a najviac ${powerW} W? Existujúci plán Time-of-Use sa prepíše.`
         : discharge
-          ? `Vybíjať pri limite najviac ${powerW} W a serverovo sledovať SOC do 30 %? Odhad: ${energy.toFixed(2)} kWh a ${minutes.toFixed(0)} min. Menič nemá hardvérový SOC limit; aplikácia a SofarCloud musia zostať dostupné. Ak časový plán zostane po výpadku aktívny, môže sa zopakovať.`
+          ? `Odoslať Passive režim s výkonom ${-powerW} W a serverovo sledovať SOC do 30 %? Odhad: ${energy.toFixed(2)} kWh a ${minutes.toFixed(0)} min. Živá schéma režim 3 neuvádza; export batérie do siete a znamienko výkonu ešte neboli overené na tomto meniči. Menič nemá potvrdený hardvérový SOC limit, preto môže SOC klesnúť pod 30 %. Aplikácia aj SofarCloud musia zostať dostupné.`
         : "Vrátiť menič do režimu Self-use?";
       if (!window.confirm(`${summary}\n\nPríkaz sa odošle do meniča cez SofarCloud.`)) return;
 
@@ -276,8 +286,8 @@
           ? "Menič už je v režime Self-use; príkaz sa neodoslal."
           : result.mode === "1"
             ? "Menič potvrdil Time-of-Use aj nabíjací plán pri spätnom čítaní."
-          : result.mode === "2"
-            ? `Menič potvrdil Timing plán. Server sleduje SOC ${result.start_soc} % → ${result.target_soc} %; záložný koniec ${result.schedule_end}.`
+            : result.mode === "3"
+              ? `Menič potvrdil Passive režim a výkon. Server sleduje SOC ${result.start_soc} % → ${result.target_soc} %; časový bezpečnostný limit ${result.deadline}.`
           : "SofarCloud potvrdil príkaz a aktuálny režim bol overený.";
       } catch (error) {
         showError(error);
@@ -314,7 +324,7 @@
       }
       const energy = batteryCapacityKwh * (currentSoc - 30) / 100;
       const minutes = energy / (power / 1000) * 60;
-      element.textContent = `Odhad do 30 %: ${energy.toLocaleString("sk-SK", { maximumFractionDigits: 2 })} kWh, približne ${minutes.toLocaleString("sk-SK", { maximumFractionDigits: 0 })} min pri ${power} W.`;
+      element.textContent = `Odhad do 30 %: ${energy.toLocaleString("sk-SK", { maximumFractionDigits: 2 })} kWh, približne ${minutes.toLocaleString("sk-SK", { maximumFractionDigits: 0 })} min pri ${power} W. Softvérový odhad, nie hardvérová ochrana SOC.`;
     }
 
     function showDischargeStatus(discharge) {

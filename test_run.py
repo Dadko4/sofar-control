@@ -20,6 +20,7 @@ from run import (
     load_env_file,
     parse_station_status,
     sign_sofar_request,
+    supports_passive_discharge,
 )
 
 
@@ -54,7 +55,10 @@ class SofarCloudClientTests(unittest.TestCase):
                     "usePower": 0.8,
                     "batterySoc": 72,
                     "batteryPower": -0.4,
+                    "chargePower": 0,
+                    "disChargePower": -0.4,
                     "gridPower": 0.05,
+                    "dataTime": "1792669677",
                 },
             },
             "HYD 5KTL-3PH",
@@ -69,9 +73,12 @@ class SofarCloudClientTests(unittest.TestCase):
                 "use_power": 0.8,
                 "battery_soc": 72,
                 "battery_power": -0.4,
+                "charge_power": 0,
+                "discharge_power": -0.4,
                 "grid_power": 0.05,
             },
         )
+        self.assertEqual(result["data_time"], "1792669677")
 
     def test_status_logs_in_and_reads_station_detail(self):
         client = SofarCloudClient("test@example.com", "test-password", "plant-123")
@@ -253,39 +260,30 @@ class SofarCloudClientTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     estimate_discharge(soc, power, 5)
 
-    def test_discharge_mode_parameters_enable_one_rule_and_disable_others(self):
-        params = build_mode_parameters(
-            "grid_discharge",
-            2500,
-            start_time="12:00",
-            end_time="12:51",
-            current_rules=sample_tou_rules(),
-        )
+    def test_passive_discharge_is_supported_only_for_known_model_and_fields(self):
+        fields = ["passiveManualBup", "passiveManualBlo"]
 
-        self.assertEqual(params["mode"], "2")
-        rules = params["energyStoreRuleList"]
-        self.assertEqual(len(rules), 4)
-        self.assertEqual(rules[0]["touEnable"], "0")
-        self.assertEqual(rules[0]["timingChargeEnable"], "0")
-        self.assertEqual(rules[0]["timingDischargeEnable"], "1")
-        self.assertEqual(rules[0]["timingStartDischargeTimestamp"], "12:00")
-        self.assertEqual(rules[0]["timingEndDischargeTimestamp"], "12:51")
-        self.assertEqual(rules[0]["timingDischargePower"], "2500")
+        self.assertTrue(supports_passive_discharge("HYD 5-20KTL-3PH", fields))
+        self.assertFalse(supports_passive_discharge("HYD 5KTL-3PH", fields))
+        self.assertFalse(supports_passive_discharge("HYD 5-20KTL-3PH", fields[:1]))
+
+    def test_discharge_mode_parameters_use_negative_passive_power(self):
+        params = build_mode_parameters("grid_discharge", 2500)
+
         self.assertEqual(
-            [rule["timingDischargeEnable"] for rule in rules[1:]],
-            ["0", "0", "0"],
+            params,
+            {
+                "mode": "3",
+                "passiveManualBup": -2500,
+                "passiveManualBlo": -2500,
+            },
         )
-        self.assertEqual([rule["touEnable"] for rule in rules], ["0", "0", "0", "0"])
 
-    def test_discharge_mode_parameters_reject_schedule_crossing_midnight(self):
-        with self.assertRaisesRegex(ValueError, "end later on the same day"):
-            build_mode_parameters(
-                "grid_discharge",
-                2500,
-                start_time="23:30",
-                end_time="00:10",
-                current_rules=sample_tou_rules(),
-            )
+    def test_passive_discharge_power_is_limited(self):
+        for power in (99, 2501, True, 1000.5):
+            with self.subTest(power=power):
+                with self.assertRaisesRegex(ValueError, "between 100 and 2500 W"):
+                    build_mode_parameters("grid_discharge", power)
 
     def test_request_sign_uses_only_scalar_fields(self):
         self.assertEqual(
@@ -479,19 +477,12 @@ class SofarCloudClientTests(unittest.TestCase):
     def test_discharge_is_blocked_at_or_below_the_soc_floor_before_any_write(self):
         client = SofarCloudClient("test@example.com", "test-password", "plant-123")
         schema = {
+            "model": "HYD 5-20KTL-3PH",
             "modes": [{"value": "0"}, {"value": "1"}, {"value": "2"}],
-            "fields": [
-                "timingChargeEnable",
-                "timingDischargeEnable",
-                "timingStartChargeTimestamp",
-                "timingEndChargeTimestamp",
-                "timingStartDischargeTimestamp",
-                "timingEndDischargeTimestamp",
-                "timingChargePower",
-                "timingDischargePower",
-            ],
+            "fields": ["passiveManualBup", "passiveManualBlo"],
         }
-        with patch.object(client, "get_energy_storage_schema", return_value=schema), \
+        with patch("run.ENABLE_PASSIVE_DISCHARGE", True), \
+                patch.object(client, "get_energy_storage_schema", return_value=schema), \
                 patch.object(
                     client,
                     "get_status",
@@ -509,23 +500,14 @@ class SofarCloudClientTests(unittest.TestCase):
         read_mode.assert_not_called()
         command.assert_not_called()
 
-    def test_discharge_sends_and_verifies_bounded_timing_schedule(self):
+    def test_discharge_sends_and_verifies_passive_power_even_when_mode_is_not_listed(self):
         client = SofarCloudClient("test@example.com", "test-password", "plant-123")
         client._access_token = "test-token"
         client._token_expires_at = 9999999999
-        original_rules = sample_tou_rules()
         schema = {
+            "model": "HYD 5-20KTL-3PH",
             "modes": [{"value": "0"}, {"value": "1"}, {"value": "2"}],
-            "fields": [
-                "timingChargeEnable",
-                "timingDischargeEnable",
-                "timingStartChargeTimestamp",
-                "timingEndChargeTimestamp",
-                "timingStartDischargeTimestamp",
-                "timingEndDischargeTimestamp",
-                "timingChargePower",
-                "timingDischargePower",
-            ],
+            "fields": ["passiveManualBup", "passiveManualBlo"],
         }
         socket_client = MagicMock()
         socket_client.connected = True
@@ -535,11 +517,16 @@ class SofarCloudClientTests(unittest.TestCase):
         def read_mode():
             if not mode_reads:
                 mode_reads.append(True)
-                return {"mode": "1", "energyStoreRuleList": original_rules}
-            updated_rules = command.call_args.args[0]["updateValue"]["energyStoreRuleList"]
-            return {"mode": "2", "energyStoreRuleList": updated_rules}
+                return {"mode": "0"}
+            update = command.call_args.args[0]["updateValue"]
+            return {
+                "mode": "3",
+                "passiveManualBup": update["passiveManualBup"],
+                "passiveManualBlo": update["passiveManualBlo"],
+            }
 
-        with patch.object(client, "get_energy_storage_schema", return_value=schema), \
+        with patch("run.ENABLE_PASSIVE_DISCHARGE", True), \
+                patch.object(client, "get_energy_storage_schema", return_value=schema), \
                 patch.object(
                     client,
                     "get_status",
@@ -555,13 +542,12 @@ class SofarCloudClientTests(unittest.TestCase):
             )
 
         params = command.call_args.args[0]["params"]
-        self.assertEqual(params["mode"], "2")
-        self.assertEqual(params["energyStoreRuleList"][0]["timingDischargeEnable"], "1")
-        self.assertEqual(params["energyStoreRuleList"][0]["timingDischargePower"], "2500")
-        self.assertEqual(
-            [rule["timingDischargeEnable"] for rule in params["energyStoreRuleList"][1:]],
-            ["0", "0", "0"],
-        )
+        self.assertEqual(params["mode"], "3")
+        self.assertEqual(params["passiveManualBup"], -2500)
+        self.assertEqual(params["passiveManualBlo"], -2500)
+        self.assertEqual(command.call_args.args[0]["updateValue"]["mode"], "3")
+        self.assertEqual(result["control_mode"], "passive")
+        self.assertEqual(result["mode"], "3")
         self.assertEqual(result["target_soc"], 30)
         self.assertEqual(result["start_soc"], 73)
         self.assertEqual(result["estimated_energy_kwh"], 2.15)
@@ -569,6 +555,73 @@ class SofarCloudClientTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         socket_client.connect.assert_called_once()
         socket_client.disconnect.assert_called_once()
+
+    def test_passive_discharge_is_blocked_for_unrecognized_model_before_write(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        schema = {
+            "model": "HYD 5KTL-3PH",
+            "modes": [{"value": "0"}, {"value": "1"}, {"value": "2"}],
+            "fields": ["passiveManualBup", "passiveManualBlo"],
+        }
+        with patch("run.ENABLE_PASSIVE_DISCHARGE", True), \
+                patch.object(client, "get_energy_storage_schema", return_value=schema), \
+                patch.object(client, "get_status") as get_status, \
+                patch.object(client, "read_energy_storage_mode") as read_mode, \
+                patch.object(client, "_execute_command") as command:
+            with self.assertRaisesRegex(SofarCloudError, "unavailable"):
+                client.set_energy_storage_mode(
+                    "grid_discharge",
+                    2500,
+                    confirmed=True,
+                )
+
+        get_status.assert_not_called()
+        read_mode.assert_not_called()
+        command.assert_not_called()
+
+    def test_passive_discharge_is_disabled_by_default_before_write(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        schema = {
+            "model": "HYD 5-20KTL-3PH",
+            "modes": [{"value": "0"}, {"value": "1"}, {"value": "2"}],
+            "fields": ["passiveManualBup", "passiveManualBlo"],
+        }
+        with patch("run.ENABLE_PASSIVE_DISCHARGE", False), \
+                patch.object(client, "get_energy_storage_schema", return_value=schema), \
+                patch.object(client, "get_status") as get_status, \
+                patch.object(client, "read_energy_storage_mode") as read_mode, \
+                patch.object(client, "_execute_command") as command:
+            with self.assertRaisesRegex(SofarCloudError, "disabled"):
+                client.set_energy_storage_mode(
+                    "grid_discharge",
+                    2500,
+                    confirmed=True,
+                )
+
+        get_status.assert_not_called()
+        read_mode.assert_not_called()
+        command.assert_not_called()
+
+    def test_passive_discharge_readback_must_match_signed_power(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        self.assertTrue(
+            client._passive_discharge_matches(
+                {
+                    "passiveManualBup": "-2500",
+                    "passiveManualBlo": -2500.0,
+                },
+                {
+                    "passiveManualBup": -2500,
+                    "passiveManualBlo": -2500,
+                },
+            )
+        )
+        self.assertFalse(
+            client._passive_discharge_matches(
+                {"passiveManualBup": 2500, "passiveManualBlo": -2500},
+                {"passiveManualBup": -2500, "passiveManualBlo": -2500},
+            )
+        )
 
     def test_discharge_watchdog_returns_to_self_use_at_soc_floor(self):
         watchdog = DischargeWatchdog()

@@ -62,6 +62,11 @@ BATTERY_CAPACITY_KWH = float(os.environ.get("SOFAR_BATTERY_CAPACITY_KWH", "5"))
 MAX_DISCHARGE_POWER_W = int(os.environ.get("SOFAR_MAX_DISCHARGE_POWER_W", "2500"))
 DISCHARGE_TARGET_SOC = 30
 DISCHARGE_MONITOR_INTERVAL = 10
+ENABLE_PASSIVE_DISCHARGE = os.environ.get(
+    "SOFAR_ENABLE_PASSIVE_DISCHARGE", "false"
+).lower() in {"1", "true", "yes"}
+PASSIVE_MODE_COMMAND_MODEL = "HYD 5-20KTL-3PH"
+PASSIVE_DISCHARGE_FIELDS = frozenset({"passiveManualBup", "passiveManualBlo"})
 MODE_CONTROL_LOCK = threading.RLock()
 ALLOWED_ORIGINS = {
     origin.strip()
@@ -135,8 +140,11 @@ def parse_station_status(detail, model):
             "use_power": realtime.get("usePower"),
             "battery_soc": realtime.get("batterySoc"),
             "battery_power": realtime.get("batteryPower"),
+            "charge_power": realtime.get("chargePower"),
+            "discharge_power": realtime.get("disChargePower"),
             "grid_power": realtime.get("gridPower"),
         },
+        "data_time": realtime.get("dataTime"),
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -182,13 +190,20 @@ def estimate_discharge(soc, power_w, capacity_kwh=BATTERY_CAPACITY_KWH):
     }
 
 
+def supports_passive_discharge(model, fields):
+    return (
+        model == PASSIVE_MODE_COMMAND_MODEL
+        and isinstance(fields, (list, tuple, set, frozenset))
+        and PASSIVE_DISCHARGE_FIELDS.issubset(fields)
+    )
+
+
 def build_mode_parameters(
     mode,
     power_w=None,
     today=None,
     start_time=None,
     current_rules=None,
-    end_time=None,
 ):
     if mode == "self_use":
         return {"mode": "0"}
@@ -197,45 +212,11 @@ def build_mode_parameters(
             raise ValueError(
                 f"Discharging power must be between 100 and {MAX_DISCHARGE_POWER_W} W."
             )
-        if not isinstance(current_rules, list) or len(current_rules) != 4 or not all(
-            isinstance(rule, dict) for rule in current_rules
-        ):
-            raise ValueError("Four current inverter schedule rules are required to build a discharge plan.")
-        if not isinstance(start_time, str) or not isinstance(end_time, str):
-            raise ValueError("Discharge start and end times are required.")
-        try:
-            start = datetime.strptime(start_time, "%H:%M")
-            end = datetime.strptime(end_time, "%H:%M")
-        except ValueError:
-            raise ValueError("Discharge times must use HH:MM format.") from None
-        if end <= start:
-            raise ValueError("The discharge schedule must end later on the same day.")
-
-        rules = [dict(rule) for rule in current_rules]
-        for index, rule in enumerate(rules):
-            rule.setdefault("ruleId", str(index))
-            rule.update(
-                {
-                    "touEnable": "0",
-                    "timingChargeEnable": "0",
-                    "timingDischargeEnable": "0",
-                    "timingStartChargeTimestamp": "00:00",
-                    "timingEndChargeTimestamp": "23:59",
-                    "timingStartDischargeTimestamp": "00:00",
-                    "timingEndDischargeTimestamp": "23:59",
-                    "timingChargePower": "0",
-                    "timingDischargePower": "0",
-                }
-            )
-        rules[0].update(
-            {
-                "timingDischargeEnable": "1",
-                "timingStartDischargeTimestamp": start_time,
-                "timingEndDischargeTimestamp": end_time,
-                "timingDischargePower": str(power_w),
-            }
-        )
-        return {"mode": "2", "energyStoreRuleList": rules}
+        return {
+            "mode": "3",
+            "passiveManualBup": -power_w,
+            "passiveManualBlo": -power_w,
+        }
     if mode != "grid_charge":
         raise ValueError("Unsupported inverter mode.")
     if isinstance(power_w, bool) or not isinstance(power_w, int) or not 1 <= power_w <= 2000:
@@ -504,6 +485,15 @@ class SofarCloudClient:
                             for option in mode_field.get("optionItems", [])
                         ],
                         "fields": [field.get("fieldName") for field in fields],
+                        "passive_discharge_supported": supports_passive_discharge(
+                            COMMAND_MODEL,
+                            [field.get("fieldName") for field in fields],
+                        ),
+                        "passive_discharge_enabled": ENABLE_PASSIVE_DISCHARGE
+                        and supports_passive_discharge(
+                            COMMAND_MODEL,
+                            [field.get("fieldName") for field in fields],
+                        ),
                     }
         raise SofarCloudError(
             "SofarCloud did not advertise an energy-storage mode command.",
@@ -603,9 +593,24 @@ class SofarCloudClient:
         mode_code = {
             "self_use": "0",
             "grid_charge": "1",
-            "grid_discharge": "2",
+            "grid_discharge": "3",
         }.get(mode, "")
-        if mode_code not in supported_modes:
+        passive_discharge_supported = supports_passive_discharge(
+            schema.get("model", COMMAND_MODEL),
+            schema.get("fields", []),
+        )
+        if mode == "grid_discharge":
+            if not ENABLE_PASSIVE_DISCHARGE:
+                raise SofarCloudError(
+                    "Passive discharge is disabled. Enable SOFAR_ENABLE_PASSIVE_DISCHARGE only after reviewing the export and SOC-limit risks.",
+                    "mode control",
+                )
+            if not passive_discharge_supported:
+                raise SofarCloudError(
+                    "Passive discharge is unavailable for this inverter model or command schema.",
+                    "mode control",
+                )
+        elif mode_code not in supported_modes:
             raise SofarCloudError(
                 "The live inverter schema does not support the requested mode.",
                 "mode control",
@@ -647,21 +652,6 @@ class SofarCloudClient:
                     "mode control",
                 )
         elif mode == "grid_discharge":
-            required_fields = {
-                "timingChargeEnable",
-                "timingDischargeEnable",
-                "timingStartChargeTimestamp",
-                "timingEndChargeTimestamp",
-                "timingStartDischargeTimestamp",
-                "timingEndDischargeTimestamp",
-                "timingChargePower",
-                "timingDischargePower",
-            }
-            if not required_fields.issubset(schema["fields"]):
-                raise SofarCloudError(
-                    "The live inverter schema is missing required Timing discharge fields.",
-                    "mode control",
-                )
             status = self.get_status()
             state_of_charge = status["metrics"]["battery_soc"]
             try:
@@ -676,25 +666,11 @@ class SofarCloudClient:
                     "configuration",
                 ) from None
             deadline = start_at + timedelta(seconds=discharge_plan["duration_seconds"])
-            if deadline.date() != start_at.date():
-                raise SofarCloudError(
-                    "The estimated discharge would cross midnight; increase the power or try earlier.",
-                    "mode control",
-                )
-            schedule_end = deadline.replace(second=0, microsecond=0)
-            if schedule_end <= start_at.replace(second=0, microsecond=0):
-                schedule_end = start_at.replace(second=0, microsecond=0) + timedelta(minutes=1)
-            if schedule_end.date() != start_at.date():
-                raise SofarCloudError(
-                    "The Timing schedule would cross midnight; increase the power or try earlier.",
-                    "mode control",
-                )
             discharge_plan.update(
                 {
                     "start_soc": float(state_of_charge),
                     "start_at": start_at,
                     "deadline": deadline,
-                    "schedule_end": schedule_end,
                 }
             )
 
@@ -722,27 +698,11 @@ class SofarCloudClient:
                 )
             except ValueError as error:
                 raise SofarCloudError(str(error), "mode control") from None
-        elif mode == "grid_discharge":
-            current_rules = current_mode_state.get("energyStoreRuleList")
-            if not isinstance(current_rules, list) or len(current_rules) != 4 or not all(
-                isinstance(rule, dict) for rule in current_rules
-            ):
-                raise SofarCloudError(
-                    "The inverter did not return four current schedule rules; the discharge request was not sent.",
-                    "mode control",
-                )
+        else:
             try:
-                params = build_mode_parameters(
-                    mode,
-                    power_w,
-                    start_time=discharge_plan["start_at"].strftime("%H:%M"),
-                    end_time=discharge_plan["schedule_end"].strftime("%H:%M"),
-                    current_rules=current_rules,
-                )
+                params = build_mode_parameters(mode, power_w)
             except ValueError as error:
                 raise SofarCloudError(str(error), "mode control") from None
-        else:
-            params = build_mode_parameters(mode, power_w)
         if mode == "self_use" and current_mode == mode_code:
             return {"mode": mode_code, "verified": True, "changed": False}
 
@@ -807,14 +767,14 @@ class SofarCloudClient:
                 "mode verification",
                 api_code="schedule_mismatch",
             )
-        if mode == "grid_discharge" and not self._discharge_schedule_matches(
-            verified_state.get("energyStoreRuleList"),
-            params["energyStoreRuleList"],
+        if mode == "grid_discharge" and not self._passive_discharge_matches(
+            verified_state,
+            params,
         ):
             raise SofarCloudError(
-                "SofarCloud acknowledged Timing mode, but the requested discharge schedule was not applied.",
+                "SofarCloud acknowledged Passive mode, but the requested discharge power was not applied.",
                 "mode verification",
-                api_code="schedule_mismatch",
+                api_code="power_mismatch",
             )
         result = {
             "mode": mode_code,
@@ -837,7 +797,7 @@ class SofarCloudClient:
                         discharge_plan["duration_minutes"], 1
                     ),
                     "deadline": discharge_plan["deadline"].isoformat(),
-                    "schedule_end": discharge_plan["schedule_end"].isoformat(),
+                    "control_mode": "passive",
                 }
             )
         return result
@@ -868,25 +828,19 @@ class SofarCloudClient:
         return True
 
     @staticmethod
-    def _discharge_schedule_matches(actual_rules, expected_rules):
-        if not isinstance(actual_rules, list) or len(actual_rules) != 4:
+    def _passive_discharge_matches(actual, expected):
+        if not isinstance(actual, dict):
             return False
-        fields = (
-            "timingChargeEnable",
-            "timingDischargeEnable",
-            "timingStartDischargeTimestamp",
-            "timingEndDischargeTimestamp",
-            "timingDischargePower",
-        )
-        for index, (actual, expected) in enumerate(zip(actual_rules, expected_rules)):
-            if not isinstance(actual, dict):
+        for field in PASSIVE_DISCHARGE_FIELDS:
+            try:
+                actual_power = float(actual[field])
+                expected_power = float(expected[field])
+            except (KeyError, TypeError, ValueError):
                 return False
-            if any(
-                str(actual.get(field, "")) != str(expected.get(field, ""))
-                for field in fields
+            if not math.isfinite(actual_power) or not math.isclose(
+                actual_power,
+                expected_power,
             ):
-                return False
-            if index > 0 and str(actual.get("timingDischargeEnable", "")) != "0":
                 return False
         return True
 

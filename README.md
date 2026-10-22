@@ -38,22 +38,38 @@ výkonom najviac 2 kW. Nabíjací plán začne od aktuálnej minúty a platí do
 aktuálneho dňa. Prepíše existujúce pravidlá Time-of-Use a ponechá aktívne iba
 nové pravidlo; po skončení plánu sa režim nemusí sám vrátiť na Self-use, preto
 ho skontroluj a prípadne prepnúť späť manuálne.
+Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
+`chargePower` a `disChargePower`; vybíjací výkon sa ukazuje ako kladná veľkosť,
+aj keď API posiela zápornú hodnotu.
 
-Vybíjanie používa režim Timing, nastaviteľný výkon do 2 500 W a cieľ 30 % SOC.
+Vybíjanie do siete používa kandidátsky Passive režim (kód 3), nastaviteľný výkon
+do 2 500 W a cieľ 30 % SOC. Payload používa záporný výkon v poliach
+`passiveManualBup` a `passiveManualBlo`, podľa mapovania v SofarCloud webovom
+klientovi pre model `HYD 5-20KTL-3PH`. Živá schéma zariadenia neponúka režim 3
+v zozname podporovaných režimov, preto je ovládanie predvolene vypnuté.
+V tomto projekte bol export do siete overený na zariadení krátkym 500 W testom.
+Povoľ ho cez `SOFAR_ENABLE_PASSIVE_DISCHARGE=true` iba pre overený model,
+zachovaj dohľad a skontroluj správanie pri aktualizácii režimu či výpadku.
+
 Odhad času a energie vychádza z nastavenej kapacity batérie. Server kontroluje
 SOC každých 10 sekúnd a pri dosiahnutí 30 % sa pokúsi prepnúť menič na Self-use.
-Časový plán má aj koniec vypočítaný z odhadovanej energie ako záložný limit.
-Ak server alebo SofarCloud nie sú dostupné, tento dohľad nemusí vedieť zastaviť
-menič; po výpadku môže Timing plán zostať aktívny a zopakovať sa. Nechaj
-aplikáciu aj spojenie so SofarCloud dostupné počas celého vybíjania a po teste
-over režim meniča. Schéma zariadenia neposkytuje hardvérový minimálny SOC, takže
-softvérové zastavenie nezaručuje, že SOC nikdy neklesne mierne pod 30 %.
-Smerovanie prebytku FVE do siete a skutočné vybíjanie do siete treba pri prvom
-teste overiť priamo na zariadení.
+Odhadovaný čas vybíjania je bezpečnostný záložný limit. Ak server alebo
+SofarCloud nie sú dostupné, dohľad nemusí vedieť zastaviť menič. Nechaj
+aplikáciu aj spojenie so SofarCloud dostupné počas celého testu a po ňom
+skontroluj režim. Schéma neposkytuje potvrdený hardvérový minimálny SOC, takže
+softvérové zastavenie nezaručuje, že SOC nikdy neklesne pod 30 %. Skutočný export
+batérie do siete bol potvrdený pri krátkom teste; hardvérové limity a nastavenia
+DoD/EPS treba potvrdiť v dokumentácii konkrétnej batérie a priamo v meniči.
+Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
+`chargePower` a `disChargePower`; vybíjací výkon sa ukazuje ako kladná veľkosť,
+aj keď API posiela zápornú hodnotu. Čas merania z poľa `dataTime` sa zobrazuje
+oddelene od času načítania odpovede, aby bolo viditeľné oneskorenie telemetrie.
 
 Pred každým príkazom sa zobrazí potvrdenie; nabíjanie sa odmietne, ak aktuálne
-SOC nie je dostupné alebo je aspoň 95 %. Plán sa pri čítaní späť overí vrátane
-SOC cieľa, výkonu a časového okna. Live schéma pre tento menič neuvádza
+SOC nie je dostupné alebo je aspoň 95 %. Nabíjací plán sa pri čítaní späť overí
+vrátane SOC cieľa, výkonu a časového okna. Pri Passive režime sa spätne overí
+aktívny režim a výkonový povel; hranicu 30 % zabezpečuje iba softvérový watchdog.
+Live schéma pre tento menič neuvádza
 samostatný prepínač zdroja zo siete ani pravidlo pre prebytok z FVE; pri prvom
 teste preto na zariadení over, že menič skutočne nabíja zo siete a posiela
 prebytok z FVE do batérie.
