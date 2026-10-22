@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="sk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b27">
+  <title>Sofar Opti</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, "Segoe UI", sans-serif;
+      background: #101b27;
+      color: #ecf3f8;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; }
+    main { width: min(100% - 32px, 960px); margin: 52px auto; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: clamp(1.5rem, 4vw, 2rem); }
+    .subtitle, .updated, .hint { color: #9eafbd; }
+    .subtitle { margin: 8px 0 0; }
+    button {
+      border: 1px solid #426477; border-radius: 10px; background: #1a3343;
+      color: #eaf5fc; cursor: pointer; font: inherit; padding: 10px 14px;
+    }
+    button:hover { background: #23475c; }
+    .banner { margin: 28px 0 20px; border: 1px solid #4c6271; border-radius: 12px;
+      padding: 14px 16px; background: #182633; color: #c5d4de; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+    .card { min-height: 132px; padding: 18px; border: 1px solid #283d4d; border-radius: 14px; background: #172532; }
+    .label { color: #a9bac7; font-size: .92rem; }
+    .value { margin-top: 16px; font-size: 1.8rem; font-weight: 650; }
+    .unit { color: #9eafbd; font-size: 1rem; font-weight: 400; }
+    .controls { margin-top: 20px; padding: 20px; border: 1px solid #283d4d; border-radius: 14px; background: #172532; }
+    .controls h2 { margin: 0 0 12px; font-size: 1.2rem; }
+    .control-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
+    .control-row[hidden] { display: none; }
+    select, input[type="range"] { accent-color: #69b3d0; }
+    select { min-width: 230px; padding: 10px; border: 1px solid #426477; border-radius: 8px;
+      background: #101b27; color: #ecf3f8; font: inherit; }
+    input[type="range"] { width: min(100%, 360px); }
+    .hint { margin: 14px 0 0; font-size: .9rem; line-height: 1.5; }
+    .controls button:disabled { cursor: not-allowed; opacity: .55; }
+    .updated { margin-top: 24px; font-size: .9rem; }
+    .error { color: #ffb4a8; }
+    @media (max-width: 560px) {
+      main { margin: 28px auto; }
+      header { align-items: flex-start; }
+      button { padding: 9px 11px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1 id="station">Sofar Opti</h1>
+        <p class="subtitle" id="model">Lokálny prehľad elektrárne</p>
+      </div>
+      <button id="refresh" type="button">Obnoviť</button>
+    </header>
+    <section class="banner">
+      Režimy meniča sú dostupné nižšie. Pred každou zmenou sa zobrazí potvrdenie.
+    </section>
+    <section class="cards" aria-live="polite">
+      <article class="card"><div class="label">Výroba FVE</div><div class="value" id="generation">—</div></article>
+      <article class="card"><div class="label">Spotreba domu</div><div class="value" id="consumption">—</div></article>
+      <article class="card"><div class="label">Stav batérie</div><div class="value" id="soc">—</div></article>
+      <article class="card"><div class="label">Výkon batérie</div><div class="value" id="battery">—</div></article>
+      <article class="card"><div class="label">Výkon siete</div><div class="value" id="grid">—</div></article>
+    </section>
+    <section class="controls" aria-labelledby="controls-title">
+      <h2 id="controls-title">Manuálne ovládanie</h2>
+      <div class="label">Aktuálny režim: <strong id="current-mode">Načítavam…</strong></div>
+      <div class="control-row">
+        <label for="requested-mode">Požadovaný režim</label>
+        <select id="requested-mode">
+          <option value="self_use">Self-use — menič riadi batériu</option>
+          <option value="grid_charge">Nabíjať do 95 % — iba dnes</option>
+        </select>
+        <button id="apply-mode" type="button" disabled>Nastaviť režim</button>
+      </div>
+      <div class="control-row" id="charge-power-row" hidden>
+        <label for="charge-power">Limit nabíjania</label>
+        <input id="charge-power" type="range" min="100" max="2000" step="100" value="2000">
+        <strong><span id="charge-power-value">2000</span> W</strong>
+      </div>
+      <p class="hint" id="control-hint" role="note">
+        Načítavam podporu zariadenia…
+      </p>
+    </section>
+    <p class="updated" id="status" role="status">Čakám na prvé načítanie…</p>
+  </main>
+  <script>
+    const fields = [
+      ["generation", "generation_power", "kW"],
+      ["consumption", "use_power", "kW"],
+      ["soc", "battery_soc", "%"],
+      ["battery", "battery_power", "kW"],
+      ["grid", "grid_power", "kW"]
+    ];
+    const modeNames = {
+      "0": "Self-use",
+      "1": "Time-of-Use — nabíjanie do cieľového SOC",
+      "2": "Timing"
+    };
+    let controlReady = false;
+    let currentSoc = null;
+
+    function formatValue(value, unit) {
+      if (value === null || value === undefined || value === "") return "—";
+      const number = Number(value);
+      const text = Number.isFinite(number) ? number.toLocaleString("sk-SK", { maximumFractionDigits: 2 }) : String(value);
+      return `${text} ${unit}`;
+    }
+
+    function showError(error) {
+      const status = document.getElementById("status");
+      status.textContent = error.message;
+      status.classList.add("error");
+    }
+
+    async function refresh() {
+      const status = document.getElementById("status");
+      const button = document.getElementById("refresh");
+      button.disabled = true;
+      status.classList.remove("error");
+      status.textContent = "Načítavam údaje…";
+      try {
+        const response = await fetch("/api/status", { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok) {
+          const details = [data.stage, data.api_code ? `API kód ${data.api_code}` : null,
+            data.http_status ? `HTTP ${data.http_status}` : null,
+            data.content_type ? `Content-Type ${data.content_type}` : null,
+            data.response_format ? `odpoveď ${data.response_format}` : null]
+            .filter(Boolean).join(" — ");
+          throw new Error([data.error || `Chyba HTTP ${response.status}`, details].filter(Boolean).join(" (") +
+            (details ? ")" : ""));
+        }
+        document.getElementById("station").textContent = data.station_name;
+        document.getElementById("model").textContent = data.model;
+        currentSoc = Number(data.metrics.battery_soc);
+        for (const [elementId, key, unit] of fields) {
+          document.getElementById(elementId).textContent = formatValue(data.metrics[key], unit);
+        }
+        status.textContent = `Aktualizované: ${data.updated_at}`;
+      } catch (error) {
+        status.textContent = error.message;
+        status.classList.add("error");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function loadControls() {
+      const hint = document.getElementById("control-hint");
+      const button = document.getElementById("apply-mode");
+      button.disabled = true;
+      document.getElementById("current-mode").textContent = "Overujem…";
+      try {
+        const [capabilityResponse, modeResponse] = await Promise.all([
+          fetch("/api/capabilities", { cache: "no-store" }),
+          fetch("/api/mode", { cache: "no-store" })
+        ]);
+        const [capabilities, mode] = await Promise.all([
+          capabilityResponse.json(),
+          modeResponse.json()
+        ]);
+        if (!capabilityResponse.ok) throw new Error(capabilities.error || "Nepodarilo sa načítať podporované režimy.");
+        if (!modeResponse.ok) throw new Error(mode.error || "Nepodarilo sa načítať aktuálny režim.");
+        const supported = new Set(capabilities.modes.map(item => String(item.value)));
+        const fieldsAvailable = new Set(capabilities.fields);
+        const canCharge = [
+          "touEnable", "touChargeStopSoc", "touChargePower",
+          "touStartChargeTimestamp", "touEndChargeTimestamp",
+          "touStartTimestamp", "touEndTimestamp", "touEnableWeek"
+        ].every(field => fieldsAvailable.has(field));
+        controlReady = supported.has("0") && supported.has("1") && canCharge;
+        const modeValue = String(mode.mode ?? "");
+        document.getElementById("current-mode").textContent = modeNames[modeValue] || `Neznámy (${modeValue || "—"})`;
+        hint.textContent = controlReady
+          ? "Plán nastaví začiatok na aktuálnu minútu, cieľ 95 % a limit najviac 2 kW; platí do 23:59. Prepíše existujúce pravidlá Time-of-Use. Po dnešnom pláne sa režim nemusí automaticky vrátiť na Self-use. Živá schéma meniča neuvádza samostatný prepínač zdroja zo siete ani pravidlo pre prebytok FVE, preto na meničovi over, či nabíja zo siete a posiela prebytok FVE do batérie. Vybíjanie nie je sprístupnené."
+          : "Menič aktuálne nehlási všetky potrebné polia pre bezpečné ovládanie. Príkazy sú vypnuté.";
+        button.disabled = !controlReady;
+      } catch (error) {
+        controlReady = false;
+        document.getElementById("current-mode").textContent = "Neznámy (neoverený)";
+        hint.textContent = `Ovládanie vypnuté: ${error.message}`;
+      }
+    }
+
+    async function applyMode() {
+      const mode = document.getElementById("requested-mode").value;
+      const powerW = Number(document.getElementById("charge-power").value);
+      const charge = mode === "grid_charge";
+      if (!controlReady) return;
+      if (charge && (!Number.isFinite(currentSoc) || currentSoc >= 95)) {
+        showError(new Error("Nabíjanie nie je povolené: aktuálne SOC nie je známe alebo je už aspoň 95 %."));
+        return;
+      }
+      const summary = charge
+        ? `Nastaviť nabíjací plán od aktuálnej minúty do 23:59, cieľ 95 % a najviac ${powerW} W? Existujúci plán Time-of-Use sa prepíše.`
+        : "Vrátiť menič do režimu Self-use?";
+      if (!window.confirm(`${summary}\n\nPríkaz sa odošle do meniča cez SofarCloud.`)) return;
+
+      const button = document.getElementById("apply-mode");
+      const status = document.getElementById("status");
+      button.disabled = true;
+      status.classList.remove("error");
+      status.textContent = "Odosielam príkaz a čakám na potvrdenie meniča…";
+      try {
+        const response = await fetch("/api/mode", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode, power_w: powerW, confirmed: true })
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          const details = result.stage ? ` (${result.stage})` : "";
+          throw new Error(`${result.error || `Chyba HTTP ${response.status}`}${details}`);
+        }
+        await Promise.all([refresh(), loadControls()]);
+        status.textContent = !result.changed
+          ? "Menič už je v režime Self-use; príkaz sa neodoslal."
+          : result.mode === "1"
+            ? "Menič potvrdil Time-of-Use aj nabíjací plán pri spätnom čítaní."
+          : "SofarCloud potvrdil príkaz a aktuálny režim bol overený.";
+      } catch (error) {
+        showError(error);
+        await refresh();
+        await loadControls();
+      } finally {
+        button.disabled = !controlReady;
+      }
+    }
+
+    document.getElementById("requested-mode").addEventListener("change", event => {
+      document.getElementById("charge-power-row").hidden = event.target.value !== "grid_charge";
+    });
+    document.getElementById("charge-power").addEventListener("input", event => {
+      document.getElementById("charge-power-value").textContent = event.target.value;
+    });
+    document.getElementById("refresh").addEventListener("click", refresh);
+    document.getElementById("apply-mode").addEventListener("click", applyMode);
+    refresh();
+    loadControls();
+    window.setInterval(refresh, 60_000);
+  </script>
+</body>
+</html>
