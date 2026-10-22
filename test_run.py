@@ -50,6 +50,8 @@ class SofarCloudClientTests(unittest.TestCase):
             {
                 "stationName": "Jacovce",
                 "stationState": 2,
+                "stationBatteryCapacity": 5,
+                "stationBatteryCapacityUnit": "kWh",
                 "stationRealTimeVo": {
                     "generationPower": 1.25,
                     "usePower": 0.8,
@@ -59,6 +61,18 @@ class SofarCloudClientTests(unittest.TestCase):
                     "disChargePower": -0.4,
                     "gridPower": 0.05,
                     "dataTime": "1792669677",
+                    "generationValue": 2.7,
+                    "generationValueUnit": "kWh",
+                    "useValue": 4.3,
+                    "useValueUnit": "kWh",
+                    "gridValue": 0.2,
+                    "gridValueUnit": "kWh",
+                    "buyValue": 4.4,
+                    "buyValueUnit": "kWh",
+                    "chargeValue": 3.6,
+                    "chargeValueUnit": "kWh",
+                    "disChargeValue": 1.4,
+                    "disChargeValueUnit": "kWh",
                 },
             },
             "HYD 5KTL-3PH",
@@ -66,6 +80,7 @@ class SofarCloudClientTests(unittest.TestCase):
 
         self.assertEqual(result["station_name"], "Jacovce")
         self.assertEqual(result["model"], "HYD 5KTL-3PH")
+        self.assertEqual(result["battery_capacity"], {"value": 5, "unit": "kWh"})
         self.assertEqual(
             result["metrics"],
             {
@@ -79,6 +94,17 @@ class SofarCloudClientTests(unittest.TestCase):
             },
         )
         self.assertEqual(result["data_time"], "1792669677")
+        self.assertEqual(
+            result["daily_energy"],
+            {
+                "generation": {"value": 2.7, "unit": "kWh"},
+                "consumption": {"value": 4.3, "unit": "kWh"},
+                "grid_export": {"value": 0.2, "unit": "kWh"},
+                "grid_import": {"value": 4.4, "unit": "kWh"},
+                "battery_charge": {"value": 3.6, "unit": "kWh"},
+                "battery_discharge": {"value": 1.4, "unit": "kWh"},
+            },
+        )
 
     def test_status_logs_in_and_reads_station_detail(self):
         client = SofarCloudClient("test@example.com", "test-password", "plant-123")

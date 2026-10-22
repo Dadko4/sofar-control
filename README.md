@@ -40,7 +40,9 @@ nové pravidlo; po skončení plánu sa režim nemusí sám vrátiť na Self-use
 ho skontroluj a prípadne prepnúť späť manuálne.
 Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
 `chargePower` a `disChargePower`; vybíjací výkon sa ukazuje ako kladná veľkosť,
-aj keď API posiela zápornú hodnotu.
+aj keď API posiela zápornú hodnotu. Zobrazuje tiež kapacitu batérie,
+dennú energiu výroby a spotreby, import/export siete a nabíjania/vybíjania
+batérie, vrátane jednotiek z odpovede SofarCloud.
 
 Vybíjanie do siete používa kandidátsky Passive režim (kód 3), nastaviteľný výkon
 do 2 500 W a cieľ 30 % SOC. Payload používa záporný výkon v poliach

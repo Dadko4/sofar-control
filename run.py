@@ -135,6 +135,10 @@ def parse_station_status(detail, model):
         "model": model,
         "station_name": detail.get("stationName") or "FVE",
         "station_state": detail.get("stationState"),
+        "battery_capacity": {
+            "value": detail.get("stationBatteryCapacity"),
+            "unit": detail.get("stationBatteryCapacityUnit"),
+        },
         "metrics": {
             "generation_power": realtime.get("generationPower"),
             "use_power": realtime.get("usePower"),
@@ -143,6 +147,32 @@ def parse_station_status(detail, model):
             "charge_power": realtime.get("chargePower"),
             "discharge_power": realtime.get("disChargePower"),
             "grid_power": realtime.get("gridPower"),
+        },
+        "daily_energy": {
+            "generation": {
+                "value": realtime.get("generationValue"),
+                "unit": realtime.get("generationValueUnit"),
+            },
+            "consumption": {
+                "value": realtime.get("useValue"),
+                "unit": realtime.get("useValueUnit"),
+            },
+            "grid_export": {
+                "value": realtime.get("gridValue"),
+                "unit": realtime.get("gridValueUnit"),
+            },
+            "grid_import": {
+                "value": realtime.get("buyValue"),
+                "unit": realtime.get("buyValueUnit"),
+            },
+            "battery_charge": {
+                "value": realtime.get("chargeValue"),
+                "unit": realtime.get("chargeValueUnit"),
+            },
+            "battery_discharge": {
+                "value": realtime.get("disChargeValue"),
+                "unit": realtime.get("disChargeValueUnit"),
+            },
         },
         "data_time": realtime.get("dataTime"),
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),

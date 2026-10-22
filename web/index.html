@@ -28,6 +28,7 @@
       padding: 14px 16px; background: #182633; color: #c5d4de; }
     .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
     .card { min-height: 132px; padding: 18px; border: 1px solid #283d4d; border-radius: 14px; background: #172532; }
+    .section-title { margin: 22px 0 12px; font-size: 1.15rem; }
     .label { color: #a9bac7; font-size: .92rem; }
     .value { margin-top: 16px; font-size: 1.8rem; font-weight: 650; }
     .unit { color: #9eafbd; font-size: 1rem; font-weight: 400; }
@@ -70,6 +71,16 @@
       <article class="card"><div class="label">Nabíjanie batérie</div><div class="value" id="charge">—</div></article>
       <article class="card"><div class="label">Vybíjanie batérie</div><div class="value" id="discharge">—</div></article>
       <article class="card"><div class="label">Výkon siete</div><div class="value" id="grid">—</div></article>
+      <article class="card"><div class="label">Kapacita batérie</div><div class="value" id="battery-capacity">—</div></article>
+    </section>
+    <h2 class="section-title">Energia dnes</h2>
+    <section class="cards" aria-live="polite" aria-label="Denný prehľad energie">
+      <article class="card"><div class="label">Výroba FVE</div><div class="value" id="daily-generation">—</div></article>
+      <article class="card"><div class="label">Spotreba domu</div><div class="value" id="daily-consumption">—</div></article>
+      <article class="card"><div class="label">Odber zo siete</div><div class="value" id="daily-grid-import">—</div></article>
+      <article class="card"><div class="label">Dodávka do siete</div><div class="value" id="daily-grid-export">—</div></article>
+      <article class="card"><div class="label">Energia do batérie</div><div class="value" id="daily-battery-charge">—</div></article>
+      <article class="card"><div class="label">Energia z batérie</div><div class="value" id="daily-battery-discharge">—</div></article>
     </section>
     <section class="controls" aria-labelledby="controls-title">
       <h2 id="controls-title">Manuálne ovládanie</h2>
@@ -110,6 +121,14 @@
       ["discharge", "discharge_power", "kW", true],
       ["grid", "grid_power", "kW"]
     ];
+    const dailyEnergyFields = [
+      ["daily-generation", "generation"],
+      ["daily-consumption", "consumption"],
+      ["daily-grid-import", "grid_import"],
+      ["daily-grid-export", "grid_export"],
+      ["daily-battery-charge", "battery_charge"],
+      ["daily-battery-discharge", "battery_discharge"]
+    ];
     const modeNames = {
       "0": "Self-use",
       "1": "Time-of-Use — nabíjanie do cieľového SOC",
@@ -128,6 +147,12 @@
       const displayNumber = absolute ? Math.abs(number) : number;
       const text = Number.isFinite(displayNumber) ? displayNumber.toLocaleString("sk-SK", { maximumFractionDigits: 2 }) : String(value);
       return `${text} ${unit}`;
+    }
+
+    function formatEnergyValue(energy) {
+      if (!energy || energy.value === null || energy.value === undefined || energy.value === "") return "—";
+      const unit = energy.unit || "kWh";
+      return formatValue(energy.value, unit);
     }
 
     function formatTelemetryTime(value) {
@@ -172,6 +197,10 @@
         if (!Number.isFinite(currentSoc)) currentSoc = null;
         for (const [elementId, key, unit, absolute] of fields) {
           document.getElementById(elementId).textContent = formatValue(data.metrics[key], unit, absolute);
+        }
+        document.getElementById("battery-capacity").textContent = formatEnergyValue(data.battery_capacity);
+        for (const [elementId, key] of dailyEnergyFields) {
+          document.getElementById(elementId).textContent = formatEnergyValue(data.daily_energy[key]);
         }
         updateDischargeEstimate();
         status.textContent = `Dáta meniča: ${formatTelemetryTime(data.data_time)} · načítané: ${data.updated_at}`;
