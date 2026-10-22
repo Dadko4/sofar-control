@@ -277,7 +277,7 @@
           : result.mode === "1"
             ? "Menič potvrdil Time-of-Use aj nabíjací plán pri spätnom čítaní."
           : result.mode === "2"
-            ? `Menič potvrdil Timing plán. Server sleduje SOC ${result.start_soc} % → ${result.target_soc} %; záložný koniec ${result.deadline}.`
+            ? `Menič potvrdil Timing plán. Server sleduje SOC ${result.start_soc} % → ${result.target_soc} %; záložný koniec ${result.schedule_end}.`
           : "SofarCloud potvrdil príkaz a aktuálny režim bol overený.";
       } catch (error) {
         showError(error);

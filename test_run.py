@@ -257,8 +257,8 @@ class SofarCloudClientTests(unittest.TestCase):
         params = build_mode_parameters(
             "grid_discharge",
             2500,
-            start_time="12:00:00",
-            end_time="12:51:36",
+            start_time="12:00",
+            end_time="12:51",
             current_rules=sample_tou_rules(),
         )
 
@@ -268,8 +268,8 @@ class SofarCloudClientTests(unittest.TestCase):
         self.assertEqual(rules[0]["touEnable"], "0")
         self.assertEqual(rules[0]["timingChargeEnable"], "0")
         self.assertEqual(rules[0]["timingDischargeEnable"], "1")
-        self.assertEqual(rules[0]["timingStartDischargeTimestamp"], "12:00:00")
-        self.assertEqual(rules[0]["timingEndDischargeTimestamp"], "12:51:36")
+        self.assertEqual(rules[0]["timingStartDischargeTimestamp"], "12:00")
+        self.assertEqual(rules[0]["timingEndDischargeTimestamp"], "12:51")
         self.assertEqual(rules[0]["timingDischargePower"], "2500")
         self.assertEqual(
             [rule["timingDischargeEnable"] for rule in rules[1:]],
@@ -282,8 +282,8 @@ class SofarCloudClientTests(unittest.TestCase):
             build_mode_parameters(
                 "grid_discharge",
                 2500,
-                start_time="23:30:00",
-                end_time="00:10:00",
+                start_time="23:30",
+                end_time="00:10",
                 current_rules=sample_tou_rules(),
             )
 

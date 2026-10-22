@@ -204,10 +204,10 @@ def build_mode_parameters(
         if not isinstance(start_time, str) or not isinstance(end_time, str):
             raise ValueError("Discharge start and end times are required.")
         try:
-            start = datetime.strptime(start_time, "%H:%M:%S")
-            end = datetime.strptime(end_time, "%H:%M:%S")
+            start = datetime.strptime(start_time, "%H:%M")
+            end = datetime.strptime(end_time, "%H:%M")
         except ValueError:
-            raise ValueError("Discharge times must use HH:MM:SS format.") from None
+            raise ValueError("Discharge times must use HH:MM format.") from None
         if end <= start:
             raise ValueError("The discharge schedule must end later on the same day.")
 
@@ -219,10 +219,10 @@ def build_mode_parameters(
                     "touEnable": "0",
                     "timingChargeEnable": "0",
                     "timingDischargeEnable": "0",
-                    "timingStartChargeTimestamp": "00:00:00",
-                    "timingEndChargeTimestamp": "23:59:59",
-                    "timingStartDischargeTimestamp": "00:00:00",
-                    "timingEndDischargeTimestamp": "23:59:59",
+                    "timingStartChargeTimestamp": "00:00",
+                    "timingEndChargeTimestamp": "23:59",
+                    "timingStartDischargeTimestamp": "00:00",
+                    "timingEndDischargeTimestamp": "23:59",
                     "timingChargePower": "0",
                     "timingDischargePower": "0",
                 }
@@ -681,11 +681,20 @@ class SofarCloudClient:
                     "The estimated discharge would cross midnight; increase the power or try earlier.",
                     "mode control",
                 )
+            schedule_end = deadline.replace(second=0, microsecond=0)
+            if schedule_end <= start_at.replace(second=0, microsecond=0):
+                schedule_end = start_at.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            if schedule_end.date() != start_at.date():
+                raise SofarCloudError(
+                    "The Timing schedule would cross midnight; increase the power or try earlier.",
+                    "mode control",
+                )
             discharge_plan.update(
                 {
                     "start_soc": float(state_of_charge),
                     "start_at": start_at,
                     "deadline": deadline,
+                    "schedule_end": schedule_end,
                 }
             )
 
@@ -726,8 +735,8 @@ class SofarCloudClient:
                 params = build_mode_parameters(
                     mode,
                     power_w,
-                    start_time=discharge_plan["start_at"].strftime("%H:%M:%S"),
-                    end_time=discharge_plan["deadline"].strftime("%H:%M:%S"),
+                    start_time=discharge_plan["start_at"].strftime("%H:%M"),
+                    end_time=discharge_plan["schedule_end"].strftime("%H:%M"),
                     current_rules=current_rules,
                 )
             except ValueError as error:
@@ -828,6 +837,7 @@ class SofarCloudClient:
                         discharge_plan["duration_minutes"], 1
                     ),
                     "deadline": discharge_plan["deadline"].isoformat(),
+                    "schedule_end": discharge_plan["schedule_end"].isoformat(),
                 }
             )
         return result
