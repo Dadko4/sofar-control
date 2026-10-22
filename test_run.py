@@ -342,6 +342,41 @@ class SofarCloudClientTests(unittest.TestCase):
         self.assertEqual(result, {"mode": "0", "verified": True, "changed": False})
         command.assert_not_called()
 
+    def test_self_use_transition_is_sent_and_verified(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        client._access_token = "test-token"
+        client._token_expires_at = 9999999999
+        schema = {
+            "modes": [{"value": "0"}, {"value": "1"}],
+            "fields": [],
+        }
+        socket_client = MagicMock()
+        socket_client.connected = True
+        command = MagicMock(return_value={"result": 1})
+
+        with patch.object(client, "get_energy_storage_schema", return_value=schema), \
+                patch.object(
+                    client,
+                    "read_energy_storage_mode",
+                    side_effect=[{"mode": "1"}, {"mode": "0"}],
+                ), \
+                patch("run.socketio.Client", return_value=socket_client), \
+                patch.object(client, "_execute_command", command):
+            result = client.set_energy_storage_mode("self_use", confirmed=True)
+
+        payload = command.call_args.args[0]
+        self.assertEqual(payload["params"], {"mode": "0"})
+        self.assertEqual(payload["originValue"], {"mode": "1"})
+        self.assertEqual(payload["updateValue"], {"mode": "0"})
+        self.assertEqual(result["mode"], "0")
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["changed"])
+        self.assertIsNone(result["power_w"])
+        self.assertIsNone(result["target_soc"])
+        self.assertIsNone(result["start_time"])
+        socket_client.connect.assert_called_once()
+        socket_client.disconnect.assert_called_once()
+
     def test_charge_is_blocked_at_target_soc_before_any_write(self):
         client = SofarCloudClient("test@example.com", "test-password", "plant-123")
         schema = {
@@ -402,7 +437,6 @@ class SofarCloudClientTests(unittest.TestCase):
         client = SofarCloudClient("test@example.com", "test-password", "plant-123")
         client._access_token = "test-token"
         client._token_expires_at = 9999999999
-        original_rules = sample_tou_rules()
         schema = {
             "modes": [{"value": "0"}, {"value": "1"}],
             "fields": [
@@ -424,7 +458,7 @@ class SofarCloudClientTests(unittest.TestCase):
         def read_mode():
             if not mode_reads:
                 mode_reads.append(True)
-                return {"mode": "0", "energyStoreRuleList": original_rules}
+                return {"mode": "0"}
             updated_rules = command.call_args.args[0]["updateValue"]["energyStoreRuleList"]
             return {"mode": "1", "energyStoreRuleList": updated_rules}
 
@@ -456,11 +490,68 @@ class SofarCloudClientTests(unittest.TestCase):
         self.assertRegex(charge_rule["touStartChargeTimestamp"], r"^\d{2}:\d{2}$")
         self.assertEqual(charge_rule["touEndChargeTimestamp"], "23:59")
         self.assertEqual([rule["touEnable"] for rule in params["energyStoreRuleList"][1:]], ["0", "0", "0"])
-        self.assertEqual(command.call_args.args[0]["originValue"]["energyStoreRuleList"], original_rules)
+        self.assertEqual(command.call_args.args[0]["originValue"], {"mode": "0"})
+        self.assertEqual(
+            [rule["ruleId"] for rule in params["energyStoreRuleList"]],
+            ["0", "1", "2", "3"],
+        )
+        self.assertEqual(
+            [rule["touId"] for rule in params["energyStoreRuleList"]],
+            ["0", "0", "0", "0"],
+        )
+        self.assertEqual(
+            [rule["touEnableWeek"] for rule in params["energyStoreRuleList"]],
+            ["1,2,3,4,5,6,7"] * 4,
+        )
+        self.assertEqual(
+            [rule["touModeControl"] for rule in params["energyStoreRuleList"]],
+            ["0"] * 4,
+        )
+        self.assertEqual(len(mode_reads), 1)
         self.assertEqual(result["mode"], "1")
         self.assertTrue(result["verified"])
         socket_client.connect.assert_called_once()
         socket_client.disconnect.assert_called_once()
+
+    def test_charge_does_not_replace_unknown_rules_outside_self_use(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        schema = {
+            "modes": [{"value": "0"}, {"value": "1"}],
+            "fields": [
+                "touEnable",
+                "touChargeStopSoc",
+                "touChargePower",
+                "touStartChargeTimestamp",
+                "touEndChargeTimestamp",
+                "touStartTimestamp",
+                "touEndTimestamp",
+                "touEnableWeek",
+            ],
+        }
+
+        with patch.object(client, "get_energy_storage_schema", return_value=schema), \
+                patch.object(
+                    client,
+                    "get_status",
+                    return_value={"metrics": {"battery_soc": 24}},
+                ), \
+                patch.object(
+                    client,
+                    "read_energy_storage_mode",
+                    return_value={"mode": "1"},
+                ), \
+                patch.object(client, "_execute_command") as command:
+            with self.assertRaisesRegex(
+                SofarCloudError,
+                "did not return its current Time-of-Use rules",
+            ):
+                client.set_energy_storage_mode(
+                    "grid_charge",
+                    2000,
+                    confirmed=True,
+                )
+
+        command.assert_not_called()
 
     def test_charge_is_not_reported_successful_when_schedule_was_ignored(self):
         client = SofarCloudClient("test@example.com", "test-password", "plant-123")

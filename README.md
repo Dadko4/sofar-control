@@ -37,7 +37,10 @@ Rozhranie ponúka Self-use a časovo obmedzené nabíjanie do 95 % s nastaviteľ
 výkonom najviac 2 kW. Nabíjací plán začne od aktuálnej minúty a platí do 23:59
 aktuálneho dňa. Prepíše existujúce pravidlá Time-of-Use a ponechá aktívne iba
 nové pravidlo; po skončení plánu sa režim nemusí sám vrátiť na Self-use, preto
-ho skontroluj a prípadne prepnúť späť manuálne.
+ho skontroluj a prípadne prepnúť späť manuálne. Ak menič v režime Self-use
+nevráti uložené pravidlá Time-of-Use, aplikácia použije štandardnú
+štvorpravidlovú štruktúru SofarCloud; mimo Self-use sa pri chýbajúcich
+pravidlách nabíjanie odmietne, aby neprepísalo neznámy plán.
 Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
 `chargePower` a `disChargePower`; vybíjací výkon sa ukazuje ako kladná veľkosť,
 aj keď API posiela zápornú hodnotu. Zobrazuje tiež kapacitu batérie,

@@ -228,6 +228,26 @@ def supports_passive_discharge(model, fields):
     )
 
 
+def default_tou_rules():
+    return [
+        {
+            "ruleId": str(index),
+            "touChargeBatteryControl": "0",
+            "touChargePower": "2000",
+            "touChargeStopSoc": "100",
+            "touEnable": "0",
+            "touEnableWeek": "1,2,3,4,5,6,7",
+            "touEndChargeTimestamp": "22:59",
+            "touEndTimestamp": "12-31",
+            "touId": "0",
+            "touModeControl": "0",
+            "touStartChargeTimestamp": "01:01",
+            "touStartTimestamp": "01-01",
+        }
+        for index in range(4)
+    ]
+
+
 def build_mode_parameters(
     mode,
     power_w=None,
@@ -716,10 +736,13 @@ class SofarCloudClient:
             if not isinstance(current_rules, list) or not current_rules or not all(
                 isinstance(rule, dict) for rule in current_rules
             ):
-                raise SofarCloudError(
-                    "The inverter did not return its current Time-of-Use rules; the charge request was not sent.",
-                    "mode control",
-                )
+                if current_mode == "0":
+                    current_rules = default_tou_rules()
+                else:
+                    raise SofarCloudError(
+                        "The inverter did not return its current Time-of-Use rules; the charge request was not sent.",
+                        "mode control",
+                    )
             try:
                 params = build_mode_parameters(
                     mode,
