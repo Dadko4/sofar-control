@@ -2214,18 +2214,39 @@ class ScheduledChargeController:
                     self._try_return_to_self_use(current)
                 return
             try:
-                with self.mode_lock:
-                    with self._lock:
-                        if self._state["status"] != "starting":
-                            return
-                    self.client.set_energy_storage_mode(
-                        "grid_charge",
-                        2000,
-                        confirmed=True,
-                        target_soc=start_plan["recommended_target_soc"],
-                    )
+                max_retries = 5
+                retry_interval_sec = 120  # 2 minutes
+                last_error = None
+                
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        with self.mode_lock:
+                            with self._lock:
+                                if self._state["status"] != "starting":
+                                    return
+                            self.client.set_energy_storage_mode(
+                                "grid_charge",
+                                2000,
+                                confirmed=True,
+                                target_soc=start_plan["recommended_target_soc"],
+                            )
+                        # Success - break out of retry loop
+                        break
+                    except (SofarCloudError, ValueError) as error:
+                        last_error = error
+                        if attempt < max_retries:
+                            LOGGER.warning(
+                                "Scheduled charging failed to start (attempt %d/%d): %s. Retrying in %d seconds...",
+                                attempt,
+                                max_retries,
+                                error,
+                                retry_interval_sec,
+                            )
+                            time.sleep(retry_interval_sec)
+                        else:
+                            raise error
             except (SofarCloudError, ValueError) as error:
-                LOGGER.error("Scheduled charging could not start: %s", error)
+                LOGGER.error("Scheduled charging could not start after %d attempts: %s", max_retries, error)
                 with self._lock:
                     if self._state["status"] != "starting":
                         return
@@ -2239,7 +2260,7 @@ class ScheduledChargeController:
                     self._save_state()
                     self._record_plan_event(
                         "plan_failed",
-                        "Scheduled charging command failed; Self-use recovery was requested.",
+                        "Scheduled charging command failed after multiple retry attempts; Self-use recovery was requested.",
                     )
                 self._try_return_to_self_use(current)
                 return
@@ -2266,28 +2287,70 @@ class ScheduledChargeController:
             self._try_return_to_self_use(current)
 
     def _try_return_to_self_use(self, current):
-        try:
-            with self.mode_lock:
+        max_retries = 5
+        retry_interval_sec = 120  # 2 minutes
+        last_error = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                with self.mode_lock:
+                    with self._lock:
+                        if self._state["status"] != "returning_to_self_use":
+                            return
+                    self.client.set_energy_storage_mode("self_use", confirmed=True)
+                
+                # Success - break out of retry loop
+                break
+            except SofarCloudError as error:
+                last_error = error
+                if attempt < max_retries:
+                    LOGGER.warning(
+                        "Scheduled plan return to Self-use failed (attempt %d/%d): %s. Retrying in %d seconds...",
+                        attempt,
+                        max_retries,
+                        error,
+                        retry_interval_sec,
+                    )
+                    time.sleep(retry_interval_sec)
+                else:
+                    LOGGER.error(
+                        "Scheduled plan could not return the inverter to Self-use after %d attempts: %s",
+                        max_retries,
+                        error,
+                    )
+                    with self._lock:
+                        if self._state["status"] == "returning_to_self_use":
+                            self._state.update(
+                                {
+                                    "error": str(error),
+                                    "retry_after": (current + timedelta(seconds=60)).isoformat(),
+                                }
+                            )
+                            self._save_state()
+                            self._record_plan_event(
+                                "self_use_return_failed",
+                                f"Could not return to Self-use after {max_retries} attempts; the app will retry.",
+                            )
+                    return
+            except ValueError as error:
+                last_error = error
+                LOGGER.error("Scheduled plan return to Self-use failed with validation error: %s", error)
                 with self._lock:
-                    if self._state["status"] != "returning_to_self_use":
-                        return
-                self.client.set_energy_storage_mode("self_use", confirmed=True)
-        except SofarCloudError as error:
-            LOGGER.error("Scheduled plan could not return the inverter to Self-use: %s", error)
-            with self._lock:
-                if self._state["status"] == "returning_to_self_use":
-                    self._state.update(
-                        {
-                            "error": str(error),
-                            "retry_after": (current + timedelta(seconds=60)).isoformat(),
-                        }
-                    )
-                    self._save_state()
-                    self._record_plan_event(
-                        "self_use_return_failed",
-                        "Could not verify return to Self-use; the app will retry.",
-                    )
-            return
+                    if self._state["status"] == "returning_to_self_use":
+                        self._state.update(
+                            {
+                                "error": str(error),
+                                "retry_after": None,
+                            }
+                        )
+                        self._save_state()
+                        self._record_plan_event(
+                            "self_use_return_failed",
+                            f"Could not return to Self-use: {error}",
+                        )
+                return
+        
+        # Success - complete the plan
         with self._lock:
             if self._state["status"] != "returning_to_self_use":
                 return
