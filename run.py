@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import closing
 from datetime import date as date_type, datetime, time as datetime_time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -2045,6 +2046,64 @@ class ScheduledChargeController:
         if warning:
             self._state["history_warning"] = warning
 
+    def _record_plan_results(self, plan_summary):
+        """Record actual results of a completed plan for comparison with estimates."""
+        if self.history_store is None or not plan_summary.get("plan_date"):
+            return
+        
+        plan_date_str = plan_summary.get("plan_date")
+        try:
+            plan_date = date_type.fromisoformat(plan_date_str)
+        except (ValueError, TypeError):
+            return
+        
+        next_date = plan_date + timedelta(days=1)
+        
+        start_ts = datetime.fromisoformat(plan_summary.get("charge_start", "")).timestamp() if plan_summary.get("charge_start") else None
+        end_ts = datetime.fromisoformat(plan_summary.get("charge_end", "")).timestamp() if plan_summary.get("charge_end") else None
+        
+        if start_ts is None or end_ts is None:
+            return
+        
+        import sqlite3
+        try:
+            with closing(self.history_store._connect()) as conn:
+                grid_import_rows = conn.execute(
+                    """
+                    SELECT SUM(observed_grid_import_delta_kwh) as total_import,
+                           SUM(observed_grid_import_cost_with_aid_eur) as total_cost_with_aid,
+                           SUM(observed_grid_import_cost_without_aid_eur) as total_cost_without_aid
+                    FROM telemetry
+                    WHERE datetime(sampled_at) >= datetime(?, 'unixepoch')
+                      AND datetime(sampled_at) < datetime(?, 'unixepoch')
+                    """,
+                    (start_ts, end_ts)
+                ).fetchone()
+        except Exception:
+            grid_import_rows = None
+        
+        if grid_import_rows:
+            actual_grid_import = grid_import_rows[0] or 0
+            actual_cost_with_aid = grid_import_rows[1] or 0
+            actual_cost_without_aid = grid_import_rows[2] or 0
+            
+            results_details = {
+                "plan_date": plan_summary.get("plan_date"),
+                "charge_start": plan_summary.get("charge_start"),
+                "charge_end": plan_summary.get("charge_end"),
+                "estimated_savings_eur": plan_summary.get("estimated_savings_eur"),
+                "actual_grid_import_kwh": round(actual_grid_import, 2),
+                "actual_cost_with_aid_eur": round(actual_cost_with_aid, 2),
+                "actual_cost_without_aid_eur": round(actual_cost_without_aid, 2),
+            }
+            
+            record_history_event(
+                self.history_store,
+                "plan_results",
+                f"Plan results for {plan_date_str}: actual grid import {round(actual_grid_import, 2)} kWh, cost €{round(actual_cost_with_aid, 2)} (with aid) / €{round(actual_cost_without_aid, 2)}.",
+                results_details,
+            )
+
     def run_due(self, now=None):
         current = now or datetime.now(ZoneInfo(TIMEZONE))
         if current.tzinfo is None:
@@ -2245,12 +2304,18 @@ class ScheduledChargeController:
                 }
             )
             self._save_state()
+            plan_summary = self._plan_event_details(self._state.get("plan") or {})
             self._record_plan_event(
                 "plan_completed",
                 "Scheduled charging ended and the inverter returned to Self-use."
                 if final_status == "completed"
                 else "Scheduled charging failed and the inverter was returned to Self-use.",
             )
+            if final_status == "completed" and self.history_store is not None:
+                try:
+                    self._record_plan_results(plan_summary)
+                except (sqlite3.Error, KeyError, TypeError, ValueError) as error:
+                    LOGGER.warning("Could not record plan results: %s", error)
             LOGGER.info("Scheduled charging ended; inverter returned to Self-use.")
 
     def cancel(self):

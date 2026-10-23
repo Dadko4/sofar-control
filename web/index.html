@@ -153,6 +153,9 @@
         <button id="refresh-history" type="button">Obnoviť históriu</button>
         <span id="history-status" class="label" role="status">Načítavam históriu…</span>
       </div>
+      <h3 class="section-title">Výsledky plánov</h3>
+      <p class="hint">Po skončení každého plánu sa zaznamenajú skutočné náklady za nabíjanie. Porovnanie s odhadmi pomáha zlepšiť budúce optimalizácie.</p>
+      <div id="plan-results" class="table-wrap"></div>
       <h3 class="section-title">Udalosti a plány</h3>
       <div id="event-history" class="table-wrap"></div>
       <h3 class="section-title">Posledné telemetrické merania</h3>
@@ -407,6 +410,31 @@
         const response = await fetch("/api/history", { cache: "no-store" });
         const history = await response.json();
         if (!response.ok) throw new Error(history.error || `Chyba HTTP ${response.status}`);
+        
+        const planResults = history.events
+          .filter(event => event.event_type === "plan_results")
+          .map(event => {
+            const details = event.details || {};
+            return [
+              details.plan_date || "—",
+              new Date(event.created_at).toLocaleString("sk-SK").split(" ")[1] || "—",
+              historyNumber(details.estimated_savings_eur, "€"),
+              historyNumber(details.actual_grid_import_kwh, "kWh"),
+              historyNumber(details.actual_cost_with_aid_eur, "€"),
+              historyNumber(details.actual_cost_without_aid_eur, "€")
+            ];
+          });
+        
+        if (planResults.length > 0) {
+          appendHistoryTable(
+            document.getElementById("plan-results"),
+            ["Dátum plánu", "Zaznamenané", "Modelovaná úspora €", "Skutočný import kWh", "Cena s pomocou €", "Cena bez pomoci €"],
+            planResults
+          );
+        } else {
+          document.getElementById("plan-results").textContent = "Zatiaľ nie sú dostupné výsledky žiadneho plánu.";
+        }
+        
         const eventRows = history.events.map(event => {
           const details = event.details || {};
           const values = [];
@@ -415,6 +443,9 @@
           }
           if (details.estimated_savings_eur !== undefined) {
             values.push(`${historyNumber(details.estimated_savings_eur, "€")} modelovaný rozdiel`);
+          }
+          if (details.actual_grid_import_kwh !== undefined) {
+            values.push(`${historyNumber(details.actual_grid_import_kwh, "kWh")} skutočný import`);
           }
           if (details.mode) values.push(`režim: ${details.mode}`);
           return [
