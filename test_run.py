@@ -1,26 +1,39 @@
 import unittest
 import base64
+import json
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.request import addinfourl
 from unittest.mock import MagicMock, patch
-from datetime import datetime, timedelta
-from threading import Event
+from datetime import datetime, timedelta, timezone
+from threading import Event, RLock
 from zoneinfo import ZoneInfo
 
 from run import (
     TIMEZONE,
     DischargeWatchdog,
+    ForecastError,
+    HistoryStore,
+    ScheduledChargeController,
     SofarCloudClient,
     SofarCloudError,
+    TelemetrySampler,
     build_mode_parameters,
+    electricity_price,
     estimate_discharge,
+    estimate_daily_consumption,
+    estimate_hourly_consumption,
+    get_solar_forecast,
     load_env_file,
+    optimize_night_charge,
     parse_station_status,
+    seasonal_daily_consumption,
     sign_sofar_request,
     supports_passive_discharge,
+    sync_consumption_history,
+    validate_optimization_settings,
 )
 
 
@@ -44,7 +57,714 @@ def sample_tou_rules():
     ]
 
 
+class OptimizationTests(unittest.TestCase):
+    @staticmethod
+    def sample_forecast(daytime_radiation):
+        start = datetime(2026, 10, 23)
+        return {
+            "location": "Jacovce",
+            "hourly": [
+                {
+                    "time": (start + timedelta(hours=hour)).isoformat(),
+                    "shortwave_radiation": (
+                        daytime_radiation
+                        if 7 <= (start + timedelta(hours=hour)).hour <= 16
+                        else 0
+                    ),
+                }
+                for hour in range(72)
+            ],
+        }
+
+    @staticmethod
+    def sample_status(soc=30):
+        return {
+            "metrics": {"battery_soc": soc},
+            "battery_capacity": {"value": 5},
+        }
+
+    def test_four_t_tariff_and_weekend_discount(self):
+        monday = datetime(2026, 10, 26)
+        saturday = datetime(2026, 10, 24)
+
+        self.assertEqual(electricity_price(monday.replace(hour=2), True), 0.052)
+        self.assertEqual(electricity_price(monday.replace(hour=10), True), 0.061)
+        self.assertEqual(electricity_price(monday.replace(hour=15), True), 0.092)
+        self.assertEqual(electricity_price(monday.replace(hour=7), True), 0.137)
+        self.assertAlmostEqual(electricity_price(saturday.replace(hour=7), True), 0.137 * 0.88)
+        self.assertEqual(electricity_price(monday.replace(hour=2), False), 0.083)
+
+    def test_seasonal_consumption_matches_configured_summer_and_winter(self):
+        self.assertAlmostEqual(
+            seasonal_daily_consumption(datetime(2026, 1, 15).date(), 6, 25),
+            25,
+        )
+        self.assertAlmostEqual(
+            seasonal_daily_consumption(datetime(2026, 7, 16).date(), 6, 25),
+            6,
+            places=2,
+        )
+
+    def test_optimizer_uses_historical_same_weekday_consumption(self):
+        target_date = datetime(2026, 10, 24).date()
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+            for days_ago, consumption in ((7, 10), (14, 12), (21, 14)):
+                historical_day = target_date - timedelta(days=days_ago)
+                for hour in range(24):
+                    power_kw = 2.4 if hour in (7, 8, 18, 19) else 0.4
+                    for sample in range(7):
+                        sampled_at = datetime.combine(
+                            historical_day,
+                            datetime.min.time(),
+                            tzinfo=ZoneInfo(TIMEZONE),
+                        ) + timedelta(hours=hour, minutes=sample * 5)
+                        history.record_telemetry(
+                            {
+                                "metrics": {"use_power": power_kw},
+                                "daily_energy": {
+                                    "consumption": {"value": consumption}
+                                },
+                            },
+                            sampled_at,
+                            0.052,
+                            0.083,
+                        )
+
+            plan = optimize_night_charge(
+                self.sample_status(),
+                self.sample_forecast(40),
+                7,
+                6,
+                25,
+                True,
+                now=datetime(2026, 10, 23, 10, tzinfo=ZoneInfo(TIMEZONE)),
+                history_store=history,
+            )
+
+        self.assertEqual(plan["consumption_estimate_source"], "same_weekday_history")
+        self.assertEqual(plan["consumption_history_days"], 3)
+        self.assertEqual(plan["estimated_daily_consumption_kwh"], 12)
+        self.assertAlmostEqual(plan["forecast_consumption_kwh"], 12)
+        hourly_by_time = {
+            item["time"][11:13]: item["consumption_kwh"]
+            for item in plan["hourly_plan"]
+        }
+        self.assertEqual(plan["hourly_consumption_profile_source"], "same_weekday_history")
+        self.assertEqual(plan["hourly_consumption_profile_days"], 3)
+        self.assertGreater(hourly_by_time["07"], hourly_by_time["12"])
+
+    def test_cloudy_forecast_recommends_more_night_charge_than_sunny_forecast(self):
+        now = datetime(2026, 10, 23, 10, tzinfo=ZoneInfo(TIMEZONE))
+        settings = (7, 6, 25, True)
+        cloudy = optimize_night_charge(
+            self.sample_status(),
+            self.sample_forecast(40),
+            *settings,
+            now=now,
+        )
+        sunny = optimize_night_charge(
+            self.sample_status(),
+            self.sample_forecast(700),
+            *settings,
+            now=now,
+        )
+
+        self.assertTrue(cloudy["recommended"])
+        self.assertGreater(
+            cloudy["recommended_grid_charge_kwh"],
+            sunny["recommended_grid_charge_kwh"],
+        )
+        self.assertEqual(cloudy["charge_start_date"], "2026-10-24")
+        self.assertEqual(cloudy["charge_start"][11:13], "04")
+        self.assertEqual(cloudy["charge_end"], "2026-10-24T06:00+02:00")
+        self.assertEqual(cloudy["plan_date"], "2026-10-24")
+        self.assertEqual(len(cloudy["hourly_plan"]), 24)
+        self.assertEqual(cloudy["hourly_plan"][0]["time"], "2026-10-24T00:00+02:00")
+        self.assertEqual(cloudy["hourly_plan"][-1]["time"], "2026-10-24T23:00+02:00")
+        self.assertAlmostEqual(
+            sum(hour["grid_charge_kwh"] for hour in cloudy["hourly_plan"]),
+            cloudy["recommended_grid_charge_kwh"],
+            places=2,
+        )
+        self.assertEqual(cloudy["recommended_target_soc"], 95)
+        self.assertGreaterEqual(cloudy["estimated_savings_eur"], 0)
+
+    def test_optimizer_respects_nine_hour_night_during_dst_fallback(self):
+        start = datetime(2026, 10, 24, tzinfo=timezone.utc)
+        forecast = {
+            "location": "Jacovce",
+            "hourly": [
+                {
+                    "time": (start + timedelta(hours=hour)).isoformat(),
+                    "shortwave_radiation": 0,
+                }
+                for hour in range(72)
+            ],
+        }
+        plan = optimize_night_charge(
+            {
+                "metrics": {"battery_soc": 30},
+                "battery_capacity": {"value": 100},
+            },
+            forecast,
+            7,
+            100,
+            100,
+            True,
+            now=datetime(2026, 10, 24, 10, tzinfo=ZoneInfo(TIMEZONE)),
+        )
+
+        self.assertGreater(plan["recommended_grid_charge_kwh"], 17.9)
+        self.assertEqual(plan["charge_start"], "2026-10-24T22:00+02:00")
+        self.assertEqual(plan["charge_end"], "2026-10-25T06:00+01:00")
+        self.assertAlmostEqual(
+            plan["forecast_consumption_kwh"],
+            plan["estimated_daily_consumption_kwh"],
+            places=2,
+        )
+
+    def test_optimizer_does_not_recommend_charge_when_battery_is_above_target(self):
+        status = {
+            "metrics": {"battery_soc": 100},
+            "battery_capacity": {"value": 100},
+        }
+        forecast_start = datetime(2026, 10, 23, tzinfo=timezone.utc)
+        forecast = {
+            "location": "Jacovce",
+            "hourly": [
+                {
+                    "time": (forecast_start + timedelta(hours=hour)).isoformat(),
+                    "shortwave_radiation": 0,
+                }
+                for hour in range(72)
+            ],
+        }
+        plan = optimize_night_charge(
+            status,
+            forecast,
+            7,
+            1,
+            1,
+            True,
+            now=datetime(2026, 10, 23, 22, tzinfo=ZoneInfo(TIMEZONE)),
+        )
+
+        self.assertFalse(plan["recommended"])
+        self.assertEqual(plan["recommended_grid_charge_kwh"], 0)
+        self.assertIsNone(plan["recommended_target_soc"])
+
+    def test_optimizer_rejects_incomplete_forecast_and_invalid_settings(self):
+        now = datetime(2026, 10, 23, 10, tzinfo=ZoneInfo(TIMEZONE))
+        with self.assertRaises(ForecastError):
+            optimize_night_charge(
+                self.sample_status(),
+                {"hourly": []},
+                7,
+                6,
+                25,
+                True,
+                now=now,
+            )
+        with self.assertRaisesRegex(ValueError, "between 0.1 and 100"):
+            validate_optimization_settings(
+                {
+                    "location": "Jacovce",
+                    "pv_capacity_kwp": 0,
+                    "summer_consumption_kwh": 6,
+                    "winter_consumption_kwh": 25,
+                    "energy_aid": True,
+                }
+            )
+
+    def test_weather_forecast_resolves_slovak_location_and_hourly_radiation(self):
+        with patch(
+            "run._open_meteo_json",
+            side_effect=[
+                {
+                    "results": [
+                        {
+                            "name": "Jacovce",
+                            "country": "Slovakia",
+                            "country_code": "SK",
+                            "latitude": 48.6,
+                            "longitude": 18.2,
+                        }
+                    ]
+                },
+                {
+                    "hourly": {
+                        "time": ["2026-10-23T11:00"],
+                        "shortwave_radiation": [125.5],
+                    }
+                },
+            ],
+        ) as request:
+            forecast = get_solar_forecast("Jacovce")
+
+        self.assertEqual(forecast["location"], "Jacovce")
+        self.assertEqual(forecast["hourly"][0]["shortwave_radiation"], 125.5)
+        self.assertEqual(request.call_count, 2)
+
+
+class ScheduledChargeTests(unittest.TestCase):
+    @staticmethod
+    def make_plan(now):
+        return {
+            "generated_at": now.isoformat(),
+            "charge_start": (now + timedelta(hours=17)).isoformat(),
+            "charge_end": (now + timedelta(hours=18)).isoformat(),
+            "recommended": True,
+            "recommended_target_soc": 80,
+            "recommended_grid_charge_kwh": 1.5,
+            "estimated_savings_eur": 0.2,
+            "plan_date": (now + timedelta(days=1)).date().isoformat(),
+        }
+
+    def test_plan_persists_and_switches_to_charge_then_self_use(self):
+        now = datetime(2026, 10, 23, 12, tzinfo=ZoneInfo(TIMEZONE))
+        client = MagicMock()
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "scheduled-plan.json"
+            controller = ScheduledChargeController(
+                client, state_path, RLock(), lambda: False
+            )
+            plan = self.make_plan(now)
+
+            saved = controller.schedule(plan, now=now)
+            self.assertEqual(saved["status"], "pending")
+            restored = ScheduledChargeController(
+                client, state_path, RLock(), lambda: False
+            )
+            self.assertEqual(restored.get_state()["plan"], plan)
+
+            restored.run_due(now=now + timedelta(hours=17) - timedelta(seconds=1))
+            client.set_energy_storage_mode.assert_not_called()
+            restored.run_due(now=now + timedelta(hours=17))
+            self.assertEqual(restored.get_state()["status"], "charging")
+            client.set_energy_storage_mode.assert_called_once_with(
+                "grid_charge",
+                2000,
+                confirmed=True,
+                target_soc=80,
+            )
+
+            restored.run_due(now=now + timedelta(hours=18))
+            self.assertEqual(restored.get_state()["status"], "completed")
+            self.assertEqual(
+                client.set_energy_storage_mode.call_args_list[-1].args,
+                ("self_use",),
+            )
+            self.assertEqual(
+                client.set_energy_storage_mode.call_args_list[-1].kwargs,
+                {"confirmed": True},
+            )
+
+    def test_active_discharge_blocks_scheduled_charge(self):
+        now = datetime(2026, 10, 23, 12, tzinfo=ZoneInfo(TIMEZONE))
+        client = MagicMock()
+        with TemporaryDirectory() as directory:
+            controller = ScheduledChargeController(
+                client,
+                Path(directory) / "scheduled-plan.json",
+                RLock(),
+                lambda: True,
+            )
+            controller.schedule(self.make_plan(now), now=now)
+            controller.run_due(now=now + timedelta(hours=17))
+
+        self.assertEqual(controller.get_state()["status"], "failed")
+        client.set_energy_storage_mode.assert_not_called()
+
+    def test_rejects_second_plan_while_first_is_active(self):
+        now = datetime(2026, 10, 23, 12, tzinfo=ZoneInfo(TIMEZONE))
+        first_plan = self.make_plan(now)
+        second_plan = self.make_plan(now)
+        second_plan["recommended_grid_charge_kwh"] = 2.5
+        client = MagicMock()
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "scheduled-plan.json"
+            controller = ScheduledChargeController(
+                client,
+                state_path,
+                RLock(),
+                lambda: False,
+            )
+            controller.schedule(first_plan, now=now)
+
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                controller.schedule(second_plan, now=now)
+
+            self.assertEqual(
+                controller.get_state()["plan"]["recommended_grid_charge_kwh"],
+                first_plan["recommended_grid_charge_kwh"],
+            )
+            persisted_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted_state["status"], "pending")
+            self.assertEqual(
+                persisted_state["plan"]["recommended_grid_charge_kwh"],
+                first_plan["recommended_grid_charge_kwh"],
+            )
+
+        client.set_energy_storage_mode.assert_not_called()
+
+    def test_schedule_rejects_stale_plan(self):
+        now = datetime(2026, 10, 23, 12, tzinfo=ZoneInfo(TIMEZONE))
+        client = MagicMock()
+        with TemporaryDirectory() as directory:
+            controller = ScheduledChargeController(
+                client,
+                Path(directory) / "scheduled-plan.json",
+                RLock(),
+                lambda: False,
+            )
+            stale_plan = self.make_plan(now - timedelta(minutes=11))
+            with self.assertRaisesRegex(ValueError, "expired"):
+                controller.schedule(stale_plan, now=now)
+
+    def test_manual_cancel_prevents_later_scheduled_mode_change(self):
+        now = datetime(2026, 10, 23, 12, tzinfo=ZoneInfo(TIMEZONE))
+        client = MagicMock()
+        with TemporaryDirectory() as directory:
+            controller = ScheduledChargeController(
+                client,
+                Path(directory) / "scheduled-plan.json",
+                RLock(),
+                lambda: False,
+            )
+            controller.schedule(self.make_plan(now), now=now)
+            controller.cancel()
+            controller.run_due(now=now + timedelta(hours=17))
+
+        self.assertEqual(controller.get_state()["status"], "cancelled")
+        client.set_energy_storage_mode.assert_not_called()
+
+    def test_interrupted_start_after_window_restores_self_use(self):
+        now = datetime(2026, 10, 23, 12, tzinfo=ZoneInfo(TIMEZONE))
+        client = MagicMock()
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "scheduled-plan.json"
+            controller = ScheduledChargeController(
+                client, state_path, RLock(), lambda: False
+            )
+            controller.schedule(self.make_plan(now), now=now)
+            controller._state["status"] = "starting"
+            controller._save_state()
+            restored = ScheduledChargeController(
+                client, state_path, RLock(), lambda: False
+            )
+            restored.run_due(now=now + timedelta(hours=18))
+
+        self.assertEqual(restored.get_state()["status"], "failed")
+        client.set_energy_storage_mode.assert_called_once_with(
+            "self_use",
+            confirmed=True,
+        )
+
+
+class HistoryStoreTests(unittest.TestCase):
+    @staticmethod
+    def record_daily_consumption(history, day, hour, consumption):
+        history.record_telemetry(
+            {"metrics": {}, "daily_energy": {"consumption": {"value": consumption}}},
+            datetime.combine(
+                day,
+                datetime.min.time(),
+                tzinfo=ZoneInfo(TIMEZONE),
+            ).replace(hour=hour, minute=55 if hour == 23 else 0),
+            0.052,
+            0.083,
+        )
+
+    def test_estimates_from_median_of_same_weekday_days(self):
+        target_date = datetime(2026, 10, 24).date()
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+            for days_ago, consumption in ((7, 10), (14, 12), (21, 40), (28, 14)):
+                self.record_daily_consumption(
+                    history,
+                    target_date - timedelta(days=days_ago),
+                    23,
+                    consumption,
+                )
+
+            estimate = estimate_daily_consumption(target_date, 6, 25, history)
+
+        self.assertEqual(estimate["source"], "same_weekday_history")
+        self.assertEqual(estimate["sample_days"], 4)
+        self.assertEqual(estimate["value_kwh"], 13)
+
+    def test_historical_cloud_points_are_persisted_and_used_for_profile(self):
+        target_date = datetime(2026, 10, 24).date()
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+            imported = []
+            for days_ago in (7, 14):
+                historical_day = target_date - timedelta(days=days_ago)
+                for hour in range(24):
+                    for sample in range(12):
+                        sampled_at = datetime.combine(
+                            historical_day,
+                            datetime.min.time(),
+                            tzinfo=ZoneInfo(TIMEZONE),
+                        ) + timedelta(hours=hour, minutes=sample * 5)
+                        imported.append(
+                            (sampled_at, 2.4 if hour in (7, 8, 18, 19) else 0.4)
+                        )
+            inserted = history.record_consumption_history(imported)
+            daily = history.daily_consumption_history(
+                target_date - timedelta(days=15),
+                target_date,
+            )
+            profile = estimate_hourly_consumption(target_date, 24, history)
+
+        self.assertEqual(inserted, 576)
+        self.assertEqual(len(daily), 2)
+        self.assertEqual(profile["source"], "same_weekday_history")
+        self.assertEqual(profile["sample_days"], 2)
+        self.assertAlmostEqual(sum(profile["hourly_kwh"]), 24)
+        self.assertGreater(profile["hourly_kwh"][7], profile["hourly_kwh"][12])
+
+    def test_cloud_history_sync_is_cached_and_refreshes_incrementally(self):
+        now = datetime(2026, 10, 23, 12, tzinfo=timezone.utc)
+        client = MagicMock()
+        client.get_consumption_history.return_value = []
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+
+            self.assertEqual(sync_consumption_history(client, history, now), 0)
+            initial_start, initial_end = client.get_consumption_history.call_args.args
+            self.assertEqual(initial_end, now)
+            self.assertEqual(initial_start, now - timedelta(days=365))
+
+            self.assertEqual(
+                sync_consumption_history(
+                    client,
+                    history,
+                    now + timedelta(hours=12),
+                ),
+                0,
+            )
+            self.assertEqual(client.get_consumption_history.call_count, 1)
+
+            self.assertEqual(
+                sync_consumption_history(
+                    client,
+                    history,
+                    now + timedelta(days=1),
+                ),
+                0,
+            )
+            refresh_start, refresh_end = client.get_consumption_history.call_args.args
+
+        self.assertEqual(refresh_end, now + timedelta(days=1))
+        self.assertEqual(refresh_start, now - timedelta(days=2))
+
+    def test_hourly_profile_falls_back_to_uniform_until_two_days_available(self):
+        target_date = datetime(2026, 10, 24).date()
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+            historical_day = target_date - timedelta(days=7)
+            for hour in range(24):
+                for sample in range(6):
+                    sampled_at = datetime.combine(
+                        historical_day,
+                        datetime.min.time(),
+                        tzinfo=ZoneInfo(TIMEZONE),
+                    ) + timedelta(hours=hour, minutes=sample * 5)
+                    history.record_telemetry(
+                        {"metrics": {"use_power": 2 if hour == 7 else 0.5}},
+                        sampled_at,
+                        0.052,
+                        0.083,
+                    )
+
+            estimate = estimate_hourly_consumption(target_date, 24, history)
+
+        self.assertEqual(estimate["source"], "uniform_estimate")
+        self.assertEqual(estimate["sample_days"], 0)
+        self.assertEqual(estimate["hourly_kwh"], [1] * 24)
+
+    def test_falls_back_to_recent_complete_days_then_seasonal_estimate(self):
+        target_date = datetime(2026, 10, 23).date()
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+            for days_ago, consumption in ((1, 10), (2, 12), (3, 14)):
+                self.record_daily_consumption(
+                    history,
+                    target_date - timedelta(days=days_ago),
+                    23,
+                    consumption,
+                )
+            self.record_daily_consumption(
+                history,
+                target_date - timedelta(days=4),
+                21,
+                100,
+            )
+
+            recent_estimate = estimate_daily_consumption(
+                target_date,
+                6,
+                25,
+                history,
+            )
+            seasonal_estimate = estimate_daily_consumption(target_date, 6, 25)
+
+        self.assertEqual(recent_estimate["source"], "recent_days_history")
+        self.assertEqual(recent_estimate["sample_days"], 3)
+        self.assertEqual(recent_estimate["value_kwh"], 12)
+        self.assertEqual(seasonal_estimate["source"], "seasonal_estimate")
+        self.assertEqual(seasonal_estimate["sample_days"], 0)
+
+    def test_mode_change_is_logged_by_client(self):
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+            client = SofarCloudClient("user", "password", "plant")
+            client.history_store = history
+
+            client._record_mode_event(
+                "grid_charge",
+                "1",
+                {
+                    "changed": True,
+                    "power_w": 1200,
+                    "target_soc": 95,
+                    "start_time": "22:00",
+                    "end_time": "23:00",
+                },
+            )
+            event = history.recent()["events"][0]
+
+        self.assertEqual(event["event_type"], "mode_change")
+        self.assertEqual(event["details"]["mode"], "grid_charge")
+        self.assertEqual(event["details"]["power_w"], 1200)
+
+    def test_telemetry_sampler_uses_both_energy_aid_tariffs(self):
+        client = MagicMock()
+        client.get_status.return_value = {"metrics": {}, "daily_energy": {}}
+        history = MagicMock()
+        sampler = TelemetrySampler(client, history)
+        sampled_at = datetime(2026, 10, 23, 10, tzinfo=ZoneInfo(TIMEZONE))
+
+        sampler.sample_once(sampled_at)
+
+        history.record_telemetry.assert_called_once_with(
+            client.get_status.return_value,
+            sampled_at,
+            0.061,
+            0.092,
+        )
+
+    def test_records_mode_and_estimated_savings_events(self):
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+            history.record_event(
+                "mode_change",
+                "Inverter mode changed to Self-use.",
+                {"mode": "self_use", "changed": True},
+                created_at="2026-10-23T12:00:00+02:00",
+            )
+            history.record_event(
+                "optimization_calculated",
+                "Estimated savings €0.18.",
+                {"estimated_savings_eur": 0.18, "savings_are_estimated": True},
+                created_at="2026-10-23T12:01:00+02:00",
+            )
+
+            result = history.recent()
+
+        self.assertEqual(len(result["events"]), 2)
+        self.assertEqual(result["events"][0]["event_type"], "optimization_calculated")
+        self.assertTrue(result["events"][0]["details"]["savings_are_estimated"])
+        self.assertEqual(result["events"][1]["details"]["mode"], "self_use")
+
+    def test_telemetry_records_import_delta_and_tariff_cost(self):
+        with TemporaryDirectory() as directory:
+            history = HistoryStore(Path(directory) / "history.sqlite3")
+            sampled_at = datetime(2026, 10, 23, 12, tzinfo=ZoneInfo(TIMEZONE))
+            status = {
+                "data_time": "1792756800",
+                "metrics": {
+                    "generation_power": 1.2,
+                    "use_power": 0.8,
+                    "battery_soc": 72,
+                    "charge_power": 0.1,
+                    "discharge_power": 0,
+                    "grid_power": 0.05,
+                },
+                "battery_capacity": {"value": 5},
+                "daily_energy": {
+                    "generation": {"value": 2.0},
+                    "consumption": {"value": 1.5},
+                    "grid_import": {"value": 4.0},
+                    "grid_export": {"value": 0.3},
+                    "battery_charge": {"value": 0.5},
+                    "battery_discharge": {"value": 0.1},
+                },
+            }
+            history.record_telemetry(status, sampled_at, 0.061, 0.092)
+            status["daily_energy"]["grid_import"]["value"] = 4.25
+            history.record_telemetry(
+                status,
+                sampled_at + timedelta(minutes=5),
+                0.061,
+                0.092,
+            )
+
+            latest = history.recent()["telemetry"][0]
+
+        self.assertEqual(latest["battery_soc"], 72)
+        self.assertEqual(latest["daily_grid_import_kwh"], 4.25)
+        self.assertAlmostEqual(latest["observed_grid_import_delta_kwh"], 0.25)
+        self.assertAlmostEqual(
+            latest["observed_grid_import_cost_with_aid_eur"],
+            0.01525,
+        )
+        self.assertAlmostEqual(
+            latest["observed_grid_import_cost_without_aid_eur"],
+            0.023,
+        )
+
+
 class SofarCloudClientTests(unittest.TestCase):
+    def test_fetches_historical_consumption_with_payload_signature(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        client._access_token = "test-token"
+        client._token_expires_at = 9999999999
+        start_time = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        end_time = datetime(2026, 10, 23, tzinfo=timezone.utc)
+        point_time = int(datetime(2026, 10, 22, 8, tzinfo=timezone.utc).timestamp())
+        response = {
+            "code": "0",
+            "data": {
+                "curves": [
+                    {
+                        "storageName": "usePower",
+                        "unit": "kW",
+                        "detailList": [
+                            {"collectionTime": str(point_time), "value": 1.25},
+                            {"collectionTime": "invalid", "value": 2},
+                        ],
+                    }
+                ]
+            },
+        }
+
+        with patch.object(client, "_request_json", return_value=response) as request:
+            points = client.get_consumption_history(start_time, end_time)
+
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0][0].astimezone(timezone.utc).timestamp(), point_time)
+        self.assertEqual(points[0][1], 1.25)
+        args = request.call_args
+        self.assertEqual(args.args[:3], ("POST", "/api/device/stationInfo/selectStationHistoryData", "station history"))
+        self.assertEqual(args.kwargs["payload"]["paramList"], ["usePower"])
+        self.assertEqual(
+            args.kwargs["headers"]["sign"],
+            sign_sofar_request(args.kwargs["payload"]),
+        )
+
     def test_status_maps_station_realtime_values(self):
         result = parse_station_status(
             {
@@ -255,6 +975,49 @@ class SofarCloudClientTests(unittest.TestCase):
         self.assertEqual(rules[0]["touEnableWeek"], "1,2,3,4,5,6,7")
         self.assertEqual([rule["touEnable"] for rule in rules[1:]], ["0", "0", "0"])
         self.assertEqual(sample_tou_rules()[0]["touEnable"], "1")
+
+    def test_charge_plan_supports_custom_target_and_overnight_window(self):
+        from datetime import date
+
+        params = build_mode_parameters(
+            "grid_charge",
+            2000,
+            date(2026, 10, 23),
+            "22:00",
+            sample_tou_rules(),
+            target_soc=76,
+            end_time="06:00",
+            end_date=date(2026, 10, 24),
+        )
+        rule = params["energyStoreRuleList"][0]
+
+        self.assertEqual(rule["touChargeStopSoc"], "76")
+        self.assertEqual(rule["touStartChargeTimestamp"], "22:00")
+        self.assertEqual(rule["touEndChargeTimestamp"], "06:00")
+        self.assertEqual(rule["touStartTimestamp"], "10-23")
+        self.assertEqual(rule["touEndTimestamp"], "10-24")
+
+    def test_charge_plan_rejects_invalid_target_and_overnight_dates(self):
+        from datetime import date
+
+        for target_soc, end_date in (
+            (30, date(2026, 10, 24)),
+            (96, date(2026, 10, 24)),
+            (75, date(2026, 10, 23)),
+            (75, date(2026, 10, 25)),
+        ):
+            with self.subTest(target_soc=target_soc, end_date=end_date):
+                with self.assertRaises(ValueError):
+                    build_mode_parameters(
+                        "grid_charge",
+                        2000,
+                        date(2026, 10, 23),
+                        "22:00",
+                        sample_tou_rules(),
+                        target_soc=target_soc,
+                        end_time="06:00",
+                        end_date=end_date,
+                    )
 
     def test_charge_power_is_limited_to_two_kw(self):
         for power in (0, -1, 2001, True, 1000.5):
@@ -551,6 +1314,102 @@ class SofarCloudClientTests(unittest.TestCase):
                     confirmed=True,
                 )
 
+        command.assert_not_called()
+
+    def test_future_overnight_charge_plan_accepts_lower_target_than_current_soc(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        client._access_token = "test-token"
+        client._token_expires_at = 9999999999
+        tomorrow = datetime.now(ZoneInfo(TIMEZONE)).date() + timedelta(days=1)
+        original_rules = sample_tou_rules()
+        schema = {
+            "modes": [{"value": "0"}, {"value": "1"}],
+            "fields": [
+                "touEnable",
+                "touChargeStopSoc",
+                "touChargePower",
+                "touStartChargeTimestamp",
+                "touEndChargeTimestamp",
+                "touStartTimestamp",
+                "touEndTimestamp",
+                "touEnableWeek",
+            ],
+        }
+        socket_client = MagicMock()
+        socket_client.connected = True
+        command = MagicMock(return_value={"result": 1})
+
+        def read_mode():
+            if command.call_count == 0:
+                return {"mode": "0", "energyStoreRuleList": original_rules}
+            rules = command.call_args.args[0]["updateValue"]["energyStoreRuleList"]
+            return {"mode": "1", "energyStoreRuleList": rules}
+
+        with patch.object(client, "get_energy_storage_schema", return_value=schema), \
+                patch.object(
+                    client,
+                    "get_status",
+                    return_value={
+                        "metrics": {"battery_soc": 80},
+                    },
+                ), \
+                patch.object(client, "read_energy_storage_mode", side_effect=read_mode), \
+                patch("run.socketio.Client", return_value=socket_client), \
+                patch.object(client, "_execute_command", command):
+            result = client.set_energy_storage_mode(
+                "grid_charge",
+                2000,
+                confirmed=True,
+                target_soc=90,
+                charge_start_time="04:30",
+                charge_end_time="06:00",
+                charge_start_date=tomorrow.isoformat(),
+                charge_end_date=tomorrow.isoformat(),
+            )
+
+        rule = command.call_args.args[0]["params"]["energyStoreRuleList"][0]
+        self.assertEqual(rule["touChargeStopSoc"], "90")
+        self.assertEqual(rule["touStartChargeTimestamp"], "04:30")
+        self.assertEqual(rule["touEndChargeTimestamp"], "06:00")
+        self.assertEqual(result["target_soc"], 90)
+        self.assertTrue(result["verified"])
+
+    def test_expired_optimization_schedule_is_rejected_before_mode_read_or_write(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        schema = {
+            "modes": [{"value": "0"}, {"value": "1"}],
+            "fields": [
+                "touEnable",
+                "touChargeStopSoc",
+                "touChargePower",
+                "touStartChargeTimestamp",
+                "touEndChargeTimestamp",
+                "touStartTimestamp",
+                "touEndTimestamp",
+                "touEnableWeek",
+            ],
+        }
+        yesterday = datetime.now(ZoneInfo(TIMEZONE)).date() - timedelta(days=1)
+        with patch.object(client, "get_energy_storage_schema", return_value=schema), \
+                patch.object(
+                    client,
+                    "get_status",
+                    return_value={"metrics": {"battery_soc": 80}},
+                ), \
+                patch.object(client, "read_energy_storage_mode") as read_mode, \
+                patch.object(client, "_execute_command") as command:
+            with self.assertRaisesRegex(SofarCloudError, "schedule has expired"):
+                client.set_energy_storage_mode(
+                    "grid_charge",
+                    2000,
+                    confirmed=True,
+                    charge_start_time="04:00",
+                    charge_end_time="06:00",
+                    charge_start_date=yesterday.isoformat(),
+                    charge_end_date=yesterday.isoformat(),
+                )
+
+        read_mode.assert_not_called()
         command.assert_not_called()
 
     def test_charge_is_not_reported_successful_when_schedule_was_ignored(self):

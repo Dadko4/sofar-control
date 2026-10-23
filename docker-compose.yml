@@ -11,10 +11,16 @@ services:
       - /tmp
     env_file:
       - .env
+    volumes:
+      - sofar-opti-data:/data
     environment:
       SOFAR_WEB_HOST: 0.0.0.0
       SOFAR_WEB_PORT: ${SOFAR_WEB_PORT:-8765}
       SOFAR_TIMEZONE: ${SOFAR_TIMEZONE:-Europe/Bratislava}
+      SOFAR_DATA_DIR: /data
       TZ: ${SOFAR_TIMEZONE:-Europe/Bratislava}
     ports:
       - "${SOFAR_BIND_ADDRESS:-127.0.0.1}:${SOFAR_WEB_PORT:-8765}:${SOFAR_WEB_PORT:-8765}"
+
+volumes:
+  sofar-opti-data:

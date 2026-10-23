@@ -41,6 +41,74 @@ ho skontroluj a prípadne prepnúť späť manuálne. Ak menič v režime Self-u
 nevráti uložené pravidlá Time-of-Use, aplikácia použije štandardnú
 štvorpravidlovú štruktúru SofarCloud; mimo Self-use sa pri chýbajúcich
 pravidlách nabíjanie odmietne, aby neprepísalo neznámy plán.
+
+### Celodenný plán pre stálu tarifu Magna 4T
+
+Sekcia „Celodenný plán podľa počasia a tarify 4T“ používa používateľom
+nastaviteľnú obec (predvolene Jacovce), výkon panelov (7 kWp), letnú a zimnú
+spotrebu (6 a 25 kWh/deň) a prepínač energopomoci (predvolene zapnutý).
+Nastavenia sa ukladajú iba v danom prehliadači. Open-Meteo geokóduje obec na
+Slovensku a poskytuje hodinové globálne žiarenie; služba nevyžaduje API kľúč.
+
+Model simuluje každú hodinu od aktuálneho času cez celých 24 hodín
+optimalizovaného dňa. Porovnáva náklady bez nabíjania zo siete a pri rôznych
+objemoch nabitia v najlacnejšom nočnom okne; používa všetky štyri dodané pásma
+Magna 4T a víkendovú zľavu 12 %. Rozpis zobrazuje hodinovú tarifu, odhad FVE a
+spotreby, SOC, nabíjanie/odber zo siete a odhadovaný náklad. Fixný mesačný
+poplatok 1,50 € sa nemení podľa použitia, preto ho výpočet vynecháva.
+
+Po výslovnom potvrdení sa plán uloží na server. Server v odporúčanom čase
+prepne menič do nabíjania pri najviac 2 kW a na konci okna pošle príkaz
+Self-use. Do meniča sa neposiela budúci TOU časovač; plán vykonáva aplikácia,
+preto musí server a spojenie so SofarCloud zostať dostupné. Plán sa uchováva
+v `SOFAR_DATA_DIR` (predvolene `./data`, v Dockeri v perzistentnom volume).
+Po reštarte sa aktívny plán obnoví: ak čakajúci plán už vstúpil do okna, appka
+spustí nabíjanie pri návrate; po uplynutí okna ho už nespustí. Pri obnovenom
+nabíjaní appka zachová čas ukončenia. Ručné prepnutie do Self-use zruší aktívny
+plán; iné ručné režimy sa počas neho odmietnu. Ak návrat do Self-use zlyhá,
+appka opakuje pokus a v rozhraní ukazuje stav.
+
+### História a namerané údaje
+
+Aplikácia ukladá zmeny a potvrdenia režimu meniča, zlyhané povely, vypočítané
+odporúčania vrátane modelovaného odhadu úspory a udalosti aktívneho plánu
+(naplánovanie, štart, návrat do Self-use, zrušenie alebo chyba). Telemetriu
+ukladá každých päť minút: výkon FVE, spotreby, batérie a siete, SOC, kapacitu
+batérie a denné počítadlá energie. História sa ukladá v SQLite databáze
+`SOFAR_DATA_DIR/history.sqlite3` (predvolene `./data`; v Dockeri v
+perzistentnom volume) a uchováva sa bez automatického mazania. Rozhranie
+zobrazuje najnovších 50 záznamov; API umožňuje najviac 200.
+
+Pri výpočte plánu si aplikácia z SofarCloud stiahne historický výkon domu
+(`usePower`, päťminútové body) za dostupné posledné obdobie, najviac 365 dní,
+a uloží ho do rovnakej SQLite databázy. Synchronizácia sa opakuje najviac raz
+za 24 hodín; pri ďalšom načítaní obnoví posledné dni s prekrytím, aby sa
+zachytili oneskorené údaje. Dostupnosť starších meraní závisí od SofarCloud
+retencie; ak sťahovanie zlyhá, plán zobrazí upozornenie a použije už uložené
+merania alebo sezónny/rovnomerný záložný odhad.
+
+Cena odberu za interval sa odhaduje z rozdielu denného počítadla importu medzi
+dvoma vzorkami a vykazuje oba varianty tarify — s energopomocou aj bez nej.
+Prvá vzorka, zmena dňa alebo pokles počítadla vytvorí nulový prírastok.
+Tieto náklady sú len orientačné: závisia od dostupnosti a aktuálnosti dát
+SofarCloud a nie sú fakturačným meraním. Odhad úspory z optimalizácie je
+modelovaný rozdiel v nákladoch, nie nameraná ani garantovaná úspora; aplikácia
+zatiaľ nepočíta skutočnú úsporu oproti scenáru bez optimalizácie.
+
+Ide o prvý orientačný model, nie predikciu ani garanciu úspory. Denná spotreba
+sa odhaduje mediánom z posledných štyroch úplných dní rovnakého dňa v týždni;
+ak sú dostupné menej než dva také dni, použije sa medián až troch posledných
+úplných dní. Deň sa považuje za úplný, ak existuje telemetrická vzorka o 23:30
+alebo neskôr. Kým taká história nie je k dispozícii, použije sa nastavený
+sezónny odhad. Denná spotreba sa rozdelí podľa historického hodinového profilu, ak sú
+dostupné aspoň dva úplné dni s dostatkom vzoriek (aspoň 6 v každej hodine a
+aspoň 18 pokrytých hodín za deň). Profil vychádza z priemerného výkonu domu
+SofarCloud `use_power` v každej hodine a upraví sa tak, aby jeho súčet zodpovedal
+dennému odhadu. Inak sa spotreba rozdelí rovnomerne. Predpoveď žiarenia určuje
+odhad výroby FVE; korekcia spotreby podľa predpovedanej teploty sa zatiaľ
+nepoužíva. Model nezohľadňuje sklon/orientáciu panelov, opotrebenie batérie,
+exportné výnosy ani všetky distribučné poplatky. Denné riadenie vybíjania alebo
+predaja do siete zatiaľ nie je automatizované.
 Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
 `chargePower` a `disChargePower`; vybíjací výkon sa ukazuje ako kladná veľkosť,
 aj keď API posiela zápornú hodnotu. Zobrazuje tiež kapacitu batérie,
@@ -70,7 +138,7 @@ Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
 aj keď API posiela zápornú hodnotu. Čas merania z poľa `dataTime` sa zobrazuje
 oddelene od času načítania odpovede, aby bolo viditeľné oneskorenie telemetrie.
 
-Pred každým príkazom sa zobrazí potvrdenie; nabíjanie sa odmietne, ak aktuálne
+Pred naplánovaním aj manuálnym príkazom sa zobrazí potvrdenie; nabíjanie sa odmietne, ak aktuálne
 SOC nie je dostupné alebo je aspoň 95 %. Nabíjací plán sa pri čítaní späť overí
 vrátane SOC cieľa, výkonu a časového okna. Pri Passive režime sa spätne overí
 aktívny režim a výkonový povel; hranicu 30 % zabezpečuje iba softvérový watchdog.
@@ -98,6 +166,8 @@ Pre prístup z LAN nastav `SOFAR_BIND_ADDRESS` na IP servera a pridaj presný
 origin do `SOFAR_ALLOWED_ORIGINS` (napr.
 `http://192.168.1.20:8765`). Odporúčané je sprístupnenie cez reverzný proxy
 s HTTPS a jeho autentifikáciou. Port aplikácie nepresmeruj priamo do internetu.
+Aktívny plán sa uchová v pomenovanom Docker volume `sofar-opti-data`, aby sa
+dal obnoviť po reštarte kontajnera.
 
 Pri aktualizácii stiahni zmeny a spusti `docker compose up -d --build`.
 Kontajner beží ako neprivilegovaný používateľ, s read-only koreňovým
