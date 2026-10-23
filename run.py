@@ -2466,7 +2466,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
-        if origin and origin not in ALLOWED_ORIGINS:
+        if origin and origin not in ALLOWED_ORIGINS and "*" not in ALLOWED_ORIGINS:
             self._send_json(403, {"error": "Requests from this origin are not allowed."})
             return
         if self.headers.get_content_type() != "application/json":
