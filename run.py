@@ -1761,6 +1761,57 @@ class SofarCloudClient:
         return True
 
 
+def retry_set_energy_storage_mode(
+    client,
+    mode,
+    power_w=None,
+    confirmed=False,
+    target_soc=MAXIMUM_BATTERY_SOC,
+    charge_start_time=None,
+    charge_end_time="23:59",
+    charge_start_date=None,
+    charge_end_date=None,
+    max_retries=5,
+    retry_interval_sec=120,
+):
+    """Set energy storage mode with retry logic (5 attempts with 2-min intervals)."""
+    last_error = None
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = client.set_energy_storage_mode(
+                mode,
+                power_w,
+                confirmed=confirmed,
+                target_soc=target_soc,
+                charge_start_time=charge_start_time,
+                charge_end_time=charge_end_time,
+                charge_start_date=charge_start_date,
+                charge_end_date=charge_end_date,
+            )
+            return result
+        except (SofarCloudError, ValueError) as error:
+            last_error = error
+            if attempt < max_retries:
+                LOGGER.warning(
+                    "Mode change to '%s' failed (attempt %d/%d): %s. Retrying in %d seconds...",
+                    mode,
+                    attempt,
+                    max_retries,
+                    error,
+                    retry_interval_sec,
+                )
+                time.sleep(retry_interval_sec)
+            else:
+                LOGGER.error(
+                    "Mode change to '%s' failed after %d attempts: %s",
+                    mode,
+                    max_retries,
+                    error,
+                )
+                raise error
+
+
 class DischargeWatchdog:
     def __init__(self):
         self._lock = threading.Lock()
@@ -1871,22 +1922,42 @@ class DischargeWatchdog:
                     "message": f"Returning to Self-use ({reason}).",
                 }
             )
-        try:
-            with MODE_CONTROL_LOCK:
-                if stop_event.is_set():
-                    return True
-                client.set_energy_storage_mode("self_use", confirmed=True)
-        except SofarCloudError as error:
-            LOGGER.error(
-                "Could not return the inverter to Self-use after %s (stage=%s, API code=%s)",
-                reason,
-                error.stage,
-                error.api_code,
-            )
-            return False
-        self.stop(reason)
-        LOGGER.info("Discharge stopped; inverter returned to Self-use (%s).", reason)
-        return True
+        
+        max_retries = 5
+        retry_interval_sec = 120
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                with MODE_CONTROL_LOCK:
+                    if stop_event.is_set():
+                        return True
+                    client.set_energy_storage_mode("self_use", confirmed=True)
+                # Success
+                self.stop(reason)
+                LOGGER.info("Discharge stopped; inverter returned to Self-use (%s).", reason)
+                return True
+            except SofarCloudError as error:
+                if attempt < max_retries:
+                    LOGGER.warning(
+                        "Discharge return to Self-use failed (attempt %d/%d): %s. Retrying in %d seconds...",
+                        attempt,
+                        max_retries,
+                        error,
+                        retry_interval_sec,
+                    )
+                    time.sleep(retry_interval_sec)
+                else:
+                    LOGGER.error(
+                        "Could not return the inverter to Self-use after %d attempts for %s (stage=%s, API code=%s)",
+                        max_retries,
+                        reason,
+                        error.stage,
+                        error.api_code,
+                    )
+                    return False
+            except ValueError as error:
+                LOGGER.error("Discharge return to Self-use validation error: %s", error)
+                return False
 
 
 class ScheduledChargeController:
@@ -2592,7 +2663,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(409, {"error": "A discharge plan is already being monitored."})
                 return
             try:
-                result = CLIENT.set_energy_storage_mode(
+                result = retry_set_energy_storage_mode(
+                    CLIENT,
                     payload.get("mode"),
                     payload.get("power_w"),
                     confirmed=payload.get("confirmed") is True,
