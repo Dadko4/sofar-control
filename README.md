@@ -109,6 +109,19 @@ odhad výroby FVE; korekcia spotreby podľa predpovedanej teploty sa zatiaľ
 nepoužíva. Model nezohľadňuje sklon/orientáciu panelov, opotrebenie batérie,
 exportné výnosy ani všetky distribučné poplatky. Denné riadenie vybíjania alebo
 predaja do siete zatiaľ nie je automatizované.
+
+### Vyhodnotenie výsledkov plánov
+
+Po skončení každého naplánovaného nabíjania aplikácia zaznamenáva udalosť
+`plan_results` s kľúčovými údajmi:
+- Odhad ušetreného nákladu (z čas výpočtu)
+- Skutočný import energie zo siete počas plánu (z telemetrie)
+- Skutočné náklady s energopomocou a bez nej (z denných počítadiel)
+
+Dashboard zobrazuje tabuľku výsledkov plánov na konci sekcie História, kde je
+možné porovnať modelované odhady s nameraným dopadu na náklady. Táto spätná väzba
+pomáha overiť správnosť modelu a zaistiť, že úspory v praxi zodpovedajú teórii.
+API `/api/history` vracia záznamy vrátane `plan_results` udalostí s detailmi.
 Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
 `chargePower` a `disChargePower`; vybíjací výkon sa ukazuje ako kladná veľkosť,
 aj keď API posiela zápornú hodnotu. Zobrazuje tiež kapacitu batérie,
