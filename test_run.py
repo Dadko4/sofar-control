@@ -215,22 +215,85 @@ class OptimizationTests(unittest.TestCase):
         )
 
         times = [datetime.fromisoformat(hour["time"]) for hour in plan["hourly_plan"]]
-        self.assertEqual(len(times), 10)
+        self.assertEqual(len(times), 24)
         self.assertEqual(
             sum(moment.date().isoformat() == "2026-10-24" for moment in times),
             3,
         )
         self.assertEqual(
             sum(moment.date().isoformat() == "2026-10-25" for moment in times),
-            7,
+            21,
         )
         self.assertAlmostEqual(
             sum(hour["consumption_kwh"] for hour in plan["hourly_plan"]),
-            9.72,
+            23.16,
             places=2,
         )
         self.assertIn("cash_savings_eur", plan)
-        self.assertEqual(times[-1].strftime("%Y-%m-%d %H:%M"), "2026-10-25 05:00")
+        self.assertEqual(times[-1].strftime("%Y-%m-%d %H:%M"), "2026-10-25 19:00")
+
+    def test_optimizer_supports_rolling_12_and_36_hour_horizons(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        forecast = {
+            "location": "Jacovce",
+            "hourly": [
+                {
+                    "time": (start + timedelta(hours=hour)).isoformat(),
+                    "shortwave_radiation": 0,
+                }
+                for hour in range(72)
+            ],
+        }
+        now = datetime(2026, 1, 1, 12, 47, tzinfo=ZoneInfo(TIMEZONE))
+        for horizon_hours in (12, 36):
+            with self.subTest(horizon_hours=horizon_hours):
+                plan = optimize_day(
+                    self.sample_status(soc=50),
+                    forecast,
+                    7,
+                    24,
+                    24,
+                    True,
+                    now=now,
+                    planning_horizon_hours=horizon_hours,
+                )
+                self.assertEqual(len(plan["hourly_plan"]), horizon_hours)
+                self.assertEqual(plan["planning_horizon_hours"], horizon_hours)
+                start_at = datetime.fromisoformat(plan["horizon_start"])
+                end_at = datetime.fromisoformat(plan["horizon_end"])
+                self.assertEqual(
+                    (end_at - start_at).total_seconds(),
+                    horizon_hours * 3600,
+                )
+
+    def test_optimizer_rolls_start_date_forward_when_next_hour_is_tomorrow(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        forecast = {
+            "location": "Jacovce",
+            "hourly": [
+                {
+                    "time": (start + timedelta(hours=hour)).isoformat(),
+                    "shortwave_radiation": 0,
+                }
+                for hour in range(72)
+            ],
+        }
+        now = datetime(2026, 1, 1, 23, 47, tzinfo=ZoneInfo(TIMEZONE))
+
+        plan = optimize_day(
+            self.sample_status(soc=50),
+            forecast,
+            7,
+            24,
+            24,
+            True,
+            now=now,
+            planning_horizon_hours=12,
+        )
+
+        self.assertEqual(plan["plan_date"], "2026-01-02")
+        self.assertTrue(plan["horizon_start"].startswith("2026-01-02T00:00"))
+        self.assertEqual(len(plan["hourly_plan"]), 12)
 
     def test_optimizer_respects_nine_hour_night_during_dst_fallback(self):
         start = datetime(2026, 10, 24, tzinfo=timezone.utc)
@@ -316,6 +379,28 @@ class OptimizationTests(unittest.TestCase):
                     "summer_consumption_kwh": 6,
                     "winter_consumption_kwh": 25,
                     "energy_aid": True,
+                }
+            )
+        settings = validate_optimization_settings(
+            {
+                "location": "Jacovce",
+                "pv_capacity_kwp": 7,
+                "summer_consumption_kwh": 6,
+                "winter_consumption_kwh": 25,
+                "energy_aid": True,
+                "planning_horizon_hours": 36,
+            }
+        )
+        self.assertEqual(settings["planning_horizon_hours"], 36)
+        with self.assertRaisesRegex(ValueError, "12, 24 or 36"):
+            validate_optimization_settings(
+                {
+                    "location": "Jacovce",
+                    "pv_capacity_kwp": 7,
+                    "summer_consumption_kwh": 6,
+                    "winter_consumption_kwh": 25,
+                    "energy_aid": True,
+                    "planning_horizon_hours": 48,
                 }
             )
 

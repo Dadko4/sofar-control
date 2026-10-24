@@ -539,12 +539,20 @@ def validate_optimization_settings(settings):
     energy_aid = settings.get("energy_aid")
     if not isinstance(energy_aid, bool):
         raise ValueError("Energy-aid setting must be true or false.")
+    planning_horizon_hours = settings.get("planning_horizon_hours", 24)
+    if (
+        isinstance(planning_horizon_hours, bool)
+        or not isinstance(planning_horizon_hours, int)
+        or planning_horizon_hours not in {12, 24, 36}
+    ):
+        raise ValueError("Planning horizon must be 12, 24 or 36 hours.")
     return {
         "location": location.strip(),
         "pv_capacity_kwp": pv_capacity_kwp,
         "summer_consumption_kwh": summer_consumption_kwh,
         "winter_consumption_kwh": winter_consumption_kwh,
         "energy_aid": energy_aid,
+        "planning_horizon_hours": planning_horizon_hours,
     }
 
 
@@ -579,8 +587,9 @@ def optimize_day(
     energy_aid,
     now=None,
     history_store=None,
+    planning_horizon_hours=24,
 ):
-    """Compute multiple charging windows for the target day using planner.optimize_windows."""
+    """Compute charging windows across a rolling horizon."""
     
     try:
         pv_capacity_kwp = float(pv_capacity_kwp)
@@ -606,6 +615,12 @@ def optimize_day(
         raise ValueError("Battery capacity must be positive.")
     if not isinstance(forecast, dict) or not isinstance(forecast.get("hourly"), list):
         raise ForecastError("Hourly solar forecast is missing.")
+    if (
+        isinstance(planning_horizon_hours, bool)
+        or not isinstance(planning_horizon_hours, int)
+        or planning_horizon_hours not in {12, 24, 36}
+    ):
+        raise ValueError("Planning horizon must be 12, 24 or 36 hours.")
     
     try:
         local_now = now or datetime.now(ZoneInfo(TIMEZONE))
@@ -621,14 +636,10 @@ def optimize_day(
     if local_now.minute or local_now.second or local_now.microsecond:
         current_hour_utc += timedelta(hours=1)
     
-    # Plan through 06:00 on the next local day, the end of the night tariff.
-    plan_date = local_now.date()
-    horizon_end = datetime.combine(
-        plan_date + timedelta(days=1),
-        datetime_time(6, 0),  # Always end at 06:00 (night tariff boundary)
-        tzinfo=ZoneInfo(TIMEZONE),
-    )
-    horizon_end_utc = horizon_end.astimezone(timezone.utc)
+    display_timezone = ZoneInfo(TIMEZONE)
+    plan_date = current_hour_utc.astimezone(display_timezone).date()
+    horizon_end_utc = current_hour_utc + timedelta(hours=planning_horizon_hours)
+    horizon_end = horizon_end_utc.astimezone(display_timezone)
     
     forecast_hours = {}
     for item in forecast["hourly"]:
@@ -653,9 +664,14 @@ def optimize_day(
     if len(forecast_hours) < expected_hours:
         raise ForecastError("Solar forecast does not cover the next charging cycle.")
     
-    display_timezone = ZoneInfo(TIMEZONE)
     daily_profiles = {}
-    for profile_date in (plan_date, horizon_end.date()):
+    profile_dates = sorted(
+        {
+            hour.astimezone(display_timezone).date()
+            for hour in forecast_hours
+        }
+    )
+    for profile_date in profile_dates:
         daily_estimate = estimate_daily_consumption(
             profile_date,
             summer_consumption_kwh,
@@ -691,7 +707,7 @@ def optimize_day(
     
     hours = []
     for forecast_hour_utc in sorted(forecast_hours):
-        hour_local = forecast_hour_utc.astimezone(ZoneInfo(TIMEZONE))
+        hour_local = forecast_hour_utc.astimezone(display_timezone)
         daily_profile = daily_profiles[hour_local.date()]
         irradiance = forecast_hours[forecast_hour_utc]
         solar_kwh = irradiance / 1000 * pv_capacity_kwp * PV_SYSTEM_EFFICIENCY
@@ -702,18 +718,13 @@ def optimize_day(
         
         hour_begin_utc = forecast_hour_utc
         hour_end_utc = forecast_hour_utc + timedelta(hours=1)
-        hour_begin_local = hour_begin_utc.astimezone(ZoneInfo(TIMEZONE))
-        
-        fraction = 1.0
-        if forecast_hour_utc == current_hour_utc:
-            elapsed = (local_now - hour_begin_local).total_seconds() / 3600
-            fraction = max(0.0, 1.0 - elapsed)
+        hour_begin_local = hour_begin_utc.astimezone(display_timezone)
         
         hours.append(
             {
                 "start": forecast_hour_utc,
                 "begin": hour_begin_local,
-                "fraction": fraction,
+                "fraction": 1.0,
                 "price": electricity_price(hour_local, energy_aid),
                 "solar_kwh": solar_kwh,
                 "consumption_kwh": consumption_kwh,
@@ -721,7 +732,7 @@ def optimize_day(
         )
     
     if not hours:
-        raise ForecastError("No forecast hours found for the target date.")
+        raise ForecastError("No forecast hours found for the planning horizon.")
     
     terminal_price = electricity_price(horizon_end, energy_aid)
     
@@ -737,6 +748,20 @@ def optimize_day(
         "location": forecast.get("location") or "",
         "generated_at": local_now.isoformat(timespec="seconds"),
         "plan_date": plan_date.isoformat(),
+        "horizon_start": current_hour_utc.astimezone(display_timezone).isoformat(timespec="minutes"),
+        "horizon_end": horizon_end.isoformat(timespec="minutes"),
+        "planning_horizon_hours": planning_horizon_hours,
+        "initial_soc": soc,
+        "battery_model": {
+            "capacity_kwh": capacity,
+            "min_energy_kwh": battery.min_energy_kwh,
+            "max_energy_kwh": battery.max_energy_kwh,
+            "charge_efficiency": battery.charge_efficiency,
+            "discharge_efficiency": battery.discharge_efficiency,
+            "max_grid_kw": battery.max_grid_kw,
+            "max_soc": battery.max_soc,
+        },
+        "energy_aid": energy_aid,
         "windows": result["windows"],
         "cost_with_plan_eur": result["cost_with_plan_eur"],
         "cost_self_use_eur": result["cost_self_use_eur"],
@@ -2774,7 +2799,12 @@ TELEMETRY_SAMPLER = None
 def get_scheduled_plan_state():
     multi_window_state = MULTI_WINDOW_SCHEDULER.get_state()
     legacy_state = SCHEDULED_CHARGE.get_state()
-    if multi_window_state.get("status") in {"pending", "charging", "transitioning"}:
+    if multi_window_state.get("status") in {
+        "pending",
+        "charging",
+        "transitioning",
+        "evaluating",
+    }:
         return multi_window_state
     if legacy_state.get("status") in SCHEDULED_CHARGE.ACTIVE_STATUSES:
         return legacy_state
@@ -2818,6 +2848,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except sqlite3.Error as error:
                     LOGGER.exception("Could not read daily results: %s", error)
                     self._send_json(503, {"error": "Could not read daily results."})
+        elif self.path == "/api/optimization-results":
+            if HISTORY_STORE is None:
+                self._send_json(503, {"error": "History logging is not initialized."})
+            else:
+                try:
+                    plans = HISTORY_STORE.get_optimization_plans()
+                    self._send_json(200, {"plans": plans})
+                except (sqlite3.Error, ValueError, TypeError) as error:
+                    LOGGER.exception("Could not read optimization results: %s", error)
+                    self._send_json(503, {"error": "Could not read optimization results."})
         elif self.path == "/api/history":
             if HISTORY_STORE is None:
                 self._send_json(503, {"error": "History logging is not initialized."})
@@ -2854,7 +2894,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_json(400, {"error": "Invalid Content-Length."})
             return
-        if not 0 < content_length <= 4096:
+        if not 0 < content_length <= 65536:
             self._send_json(400, {"error": "Request body size is invalid."})
             return
         try:
@@ -2893,7 +2933,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         SCHEDULED_CHARGE.cancel()
                     windows = payload["windows"]
                     plan_date = payload.get("plan_date", "")
-                    result = MULTI_WINDOW_SCHEDULER.schedule_windows(windows, plan_date)
+                    result = MULTI_WINDOW_SCHEDULER.schedule_windows(
+                        windows,
+                        plan_date,
+                        payload.get("plan_snapshot"),
+                    )
                     self._send_json(202, result)
                 else:
                     # Legacy single-window scheduling
@@ -2907,7 +2951,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         raise RuntimeError(
                             "A single-window charging plan is already running."
                         )
-                    if multi_status == "pending":
+                    if multi_status in {"pending", "evaluating"}:
                         MULTI_WINDOW_SCHEDULER.cancel()
                     result = SCHEDULED_CHARGE.schedule(payload.get("plan"))
                     self._send_json(202, result)
@@ -2915,7 +2959,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": str(error), "stage": "validation"})
             except RuntimeError as error:
                 self._send_json(409, {"error": str(error), "stage": "scheduled plan"})
-            except OSError as error:
+            except (OSError, sqlite3.Error) as error:
                 LOGGER.error("Could not persist scheduled charging plan: %s", error)
                 self._send_json(500, {"error": "Could not save the scheduled charging plan."})
             return
@@ -2928,6 +2972,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             scheduled_plan_active = (
                 scheduled_status in SCHEDULED_CHARGE.ACTIVE_STATUSES
                 or multi_window_status in {"pending", "charging", "transitioning"}
+                or multi_window_status == "evaluating"
             )
             if scheduled_plan_active and payload.get("mode") != "self_use":
                 self._send_json(
@@ -3086,6 +3131,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 settings["winter_consumption_kwh"],
                 settings["energy_aid"],
                 history_store=CLIENT.history_store,
+                planning_horizon_hours=settings["planning_horizon_hours"],
             )
             if history_sync_warning:
                 result["consumption_history_sync_warning"] = history_sync_warning
@@ -3203,6 +3249,7 @@ def main():
     HISTORY_STORE = HistoryStore(DATA_DIR / "history.sqlite3")
     CLIENT.history_store = HISTORY_STORE
     SCHEDULED_CHARGE.history_store = HISTORY_STORE
+    MULTI_WINDOW_SCHEDULER.history_store = HISTORY_STORE
     TELEMETRY_SAMPLER = TelemetrySampler(CLIENT, HISTORY_STORE)
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), DashboardHandler)
     SCHEDULED_CHARGE.start()

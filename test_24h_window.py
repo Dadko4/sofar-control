@@ -1,45 +1,65 @@
-"""Test planning horizon through 06:00 on the next local day."""
+"""Check the default rolling 24-hour optimization horizon."""
 
-from datetime import datetime, time as datetime_time, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-TIMEZONE = "Europe/Bratislava"
+from run import TIMEZONE, optimize_day
 
-def test_plan_date_window():
-    """Test that the planning horizon ends at 06:00 on the next local day."""
-    
-    test_cases = [
-        # (current_time, expected_plan_date, expected_horizon_end_time)
-        ("2026-10-24 05:00:00", "2026-10-24", "2026-10-25 06:00:00"),  # 5 AM - should plan until tomorrow 6 AM
-        ("2026-10-24 06:00:00", "2026-10-24", "2026-10-25 06:00:00"),  # 6 AM - full 24h day
-        ("2026-10-24 12:00:00", "2026-10-24", "2026-10-25 06:00:00"),  # Noon - full day
-        ("2026-10-24 20:00:00", "2026-10-24", "2026-10-25 06:00:00"),  # Evening - full 24h
-        ("2026-10-24 22:00:00", "2026-10-24", "2026-10-25 06:00:00"),  # 10 PM - 8 hours tonight + 24h
-        ("2026-10-24 23:59:00", "2026-10-24", "2026-10-25 06:00:00"),  # Just before midnight
-    ]
-    
-    for current_str, expected_plan_date, expected_horizon_end in test_cases:
-        local_now = datetime.fromisoformat(current_str).replace(tzinfo=ZoneInfo(TIMEZONE))
-        
-        # This is the logic from run.py
-        plan_date = local_now.date()
-        horizon_end = datetime.combine(
-            plan_date + timedelta(days=1),
-            datetime_time(6, 0),
-            tzinfo=ZoneInfo(TIMEZONE),
+
+def test_rolling_24_hour_horizon():
+    local_timezone = ZoneInfo(TIMEZONE)
+    forecast_start = datetime(2026, 10, 24, tzinfo=timezone.utc)
+    forecast = {
+        "location": "Jacovce",
+        "hourly": [
+            {
+                "time": (forecast_start + timedelta(hours=hour)).isoformat(),
+                "shortwave_radiation": 0,
+            }
+            for hour in range(72)
+        ],
+    }
+    status = {
+        "metrics": {"battery_soc": 50},
+        "battery_capacity": {"value": 5},
+    }
+    test_times = (
+        "2026-10-24 05:00:00",
+        "2026-10-24 06:00:00",
+        "2026-10-24 12:00:00",
+        "2026-10-24 20:00:00",
+        "2026-10-24 22:00:00",
+        "2026-10-24 23:59:00",
+    )
+
+    for current_time in test_times:
+        now = datetime.fromisoformat(current_time).replace(tzinfo=local_timezone)
+        plan = optimize_day(
+            status,
+            forecast,
+            7,
+            6,
+            25,
+            True,
+            now=now,
         )
-        
-        assert plan_date.isoformat() == expected_plan_date, \
-            f"At {current_str}: expected plan_date={expected_plan_date}, got {plan_date.isoformat()}"
-        
-        assert horizon_end.isoformat() == datetime.fromisoformat(expected_horizon_end + "+01:00").isoformat(), \
-            f"At {current_str}: expected horizon_end={expected_horizon_end}, got {horizon_end.isoformat()}"
-        
-        # Check duration
-        duration_hours = (horizon_end - local_now).total_seconds() / 3600
-        print(f"✓ {current_str}: plan covers {duration_hours:.1f} hours until {horizon_end.strftime('%H:%M')}")
+        horizon_start = datetime.fromisoformat(plan["horizon_start"])
+        horizon_end = datetime.fromisoformat(plan["horizon_end"])
+        expected_start = now.astimezone(timezone.utc).replace(
+            minute=0, second=0, microsecond=0
+        )
+        if now.minute or now.second or now.microsecond:
+            expected_start += timedelta(hours=1)
+
+        assert horizon_start == expected_start.astimezone(local_timezone)
+        assert horizon_end.astimezone(timezone.utc) - horizon_start.astimezone(
+            timezone.utc
+        ) == timedelta(hours=24)
+        assert plan["plan_date"] == horizon_start.date().isoformat()
+        assert len(plan["hourly_plan"]) == 24
+        print(f"✓ {current_time}: rolling horizon {horizon_start} – {horizon_end}")
 
 
 if __name__ == "__main__":
-    test_plan_date_window()
-    print("\n✓ All 24-hour planning window tests passed!")
+    test_rolling_24_hour_horizon()
+    print("\n✓ All rolling 24-hour horizon checks passed!")

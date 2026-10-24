@@ -1,7 +1,7 @@
 """Test daily results recording and retrieval."""
 
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -73,7 +73,65 @@ def test_multiple_daily_results():
     print("✓ Multiple daily results stored and sorted correctly")
 
 
+def test_optimization_plan_forecast_and_actual_are_persisted():
+    db_path = Path(tempfile.gettempdir()) / "test_optimization_plan_results.db"
+    db_path.unlink(missing_ok=True)
+    store = HistoryStore(db_path)
+    forecast = {
+        "plan_date": "2026-10-23",
+        "horizon_start": "2026-10-23T10:00+02:00",
+        "horizon_end": "2026-10-24T10:00+02:00",
+        "hourly_plan": [],
+    }
+
+    store.record_optimization_plan("plan-1", forecast)
+    store.update_optimization_plan_result(
+        "plan-1",
+        "completed",
+        {"actual_grid_import_kwh": 1.25},
+    )
+
+    plans = store.get_optimization_plans()
+    assert len(plans) == 1
+    assert plans[0]["plan_id"] == "plan-1"
+    assert plans[0]["plan_status"] == "completed"
+    assert plans[0]["forecast"] == forecast
+    assert plans[0]["actual"]["actual_grid_import_kwh"] == 1.25
+
+
+def test_telemetry_query_includes_boundary_samples():
+    db_path = Path(tempfile.gettempdir()) / "test_plan_telemetry_range.db"
+    db_path.unlink(missing_ok=True)
+    store = HistoryStore(db_path)
+    start = datetime(2026, 10, 24, 10, tzinfo=ZoneInfo("Europe/Bratislava"))
+    end = start + timedelta(hours=1)
+    for sampled_at in (
+        start - timedelta(minutes=10),
+        start + timedelta(minutes=5),
+        end + timedelta(minutes=10),
+    ):
+        store.record_telemetry(
+            {
+                "metrics": {
+                    "generation_power": 1,
+                    "use_power": 2,
+                    "battery_soc": 50,
+                },
+                "daily_energy": {"grid_import": {"value": 1}},
+                "battery_capacity": {"value": 5},
+            },
+            sampled_at,
+            0.1,
+            0.2,
+        )
+
+    rows = store.telemetry_for_period(start.isoformat(), end.isoformat())
+    assert len(rows) == 3
+
+
 if __name__ == "__main__":
     test_record_and_retrieve_daily_result()
     test_multiple_daily_results()
+    test_optimization_plan_forecast_and_actual_are_persisted()
+    test_telemetry_query_includes_boundary_samples()
     print("\n✓ All daily results tests passed!")

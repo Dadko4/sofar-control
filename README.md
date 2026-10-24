@@ -42,20 +42,22 @@ nevráti uložené pravidlá Time-of-Use, aplikácia použije štandardnú
 štvorpravidlovú štruktúru SofarCloud; mimo Self-use sa pri chýbajúcich
 pravidlách nabíjanie odmietne, aby neprepísalo neznámy plán.
 
-### Celodenný plán pre stálu tarifu Magna 4T
+### Plánovanie podľa tarify Magna 4T
 
 Sekcia „Celodenný plán podľa počasia a tarify 4T“ používa používateľom
 nastaviteľnú obec (predvolene Jacovce), výkon panelov (7 kWp), letnú a zimnú
-spotrebu (6 a 25 kWh/deň) a prepínač energopomoci (predvolene zapnutý).
+spotrebu (6 a 25 kWh/deň), prepínač energopomoci (predvolene zapnutý) a
+plánovací horizont 12, 24 alebo 36 hodín (predvolene 24).
 Nastavenia sa ukladajú iba v danom prehliadači. Open-Meteo geokóduje obec na
 Slovensku a poskytuje hodinové globálne žiarenie; služba nevyžaduje API kľúč.
 
-Model simuluje každú hodinu od aktuálneho času cez celých 24 hodín
-optimalizovaného dňa. Porovnáva náklady bez nabíjania zo siete a pri rôznych
-objemoch nabitia v najlacnejšom nočnom okne; používa všetky štyri dodané pásma
-Magna 4T a víkendovú zľavu 12 %. Rozpis zobrazuje hodinovú tarifu, odhad FVE a
-spotreby, SOC, nabíjanie/odber zo siete a odhadovaný náklad. Fixný mesačný
-poplatok 1,50 € sa nemení podľa použitia, preto ho výpočet vynecháva.
+Horizont začína od najbližšej celej hodiny a končí po zvolenom počte
+skutočných hodín; nejde o pevný čas 06:00 ani o kalendárny deň. Model simuluje
+každú hodinu a vyberá nabíjacie okná porovnaním s režimom Self-use. Používa
+všetky štyri dodané pásma Magna 4T a víkendovú zľavu 12 %. Rozpis zobrazuje
+hodinovú tarifu, odhad FVE a spotreby, SOC, nabíjanie/odber zo siete a
+odhadovaný náklad. Fixný mesačný poplatok 1,50 € sa nemení podľa použitia,
+preto ho výpočet vynecháva.
 
 Po výslovnom potvrdení sa plán uloží na server. Server v odporúčanom čase
 prepne menič do nabíjania pri najviac 2 kW a na konci okna pošle príkaz
@@ -91,9 +93,10 @@ Cena odberu za interval sa odhaduje z rozdielu denného počítadla importu medz
 dvoma vzorkami a vykazuje oba varianty tarify — s energopomocou aj bez nej.
 Prvá vzorka, zmena dňa alebo pokles počítadla vytvorí nulový prírastok.
 Tieto náklady sú len orientačné: závisia od dostupnosti a aktuálnosti dát
-SofarCloud a nie sú fakturačným meraním. Odhad úspory z optimalizácie je
-modelovaný rozdiel v nákladoch, nie nameraná ani garantovaná úspora; aplikácia
-zatiaľ nepočíta skutočnú úsporu oproti scenáru bez optimalizácie.
+SofarCloud a nie sú fakturačným meraním. Forecast úspory je modelovaný odhad.
+Po aplikovaní plánu sa po skončení jeho horizontu uloží porovnanie s
+telemetriou a simulovaný kontrafaktuál Self-use; úspora stále nie je priamo
+nameraná ani garantovaná.
 
 Ide o prvý orientačný model, nie predikciu ani garanciu úspory. Denná spotreba
 sa odhaduje mediánom z posledných štyroch úplných dní rovnakého dňa v týždni;
@@ -112,16 +115,22 @@ predaja do siete zatiaľ nie je automatizované.
 
 ### Vyhodnotenie výsledkov plánov
 
-Po skončení každého naplánovaného nabíjania aplikácia zaznamenáva udalosť
-`plan_results` s kľúčovými údajmi:
-- Odhad ušetreného nákladu (z čas výpočtu)
-- Skutočný import energie zo siete počas plánu (z telemetrie)
-- Skutočné náklady s energopomocou a bez nej (z denných počítadiel)
+Pri potvrdení plánu sa uloží jedinečný identifikátor a úplný hodinový forecast.
+Po skončení nabíjacích okien menič prejde do Self-use; vyhodnotenie pokračuje
+zbieraním telemetrie až do konca zvoleného horizontu. Počas tohto zberu sa stav
+plánu zobrazuje ako „vyhodnocuje telemetriu“. Nahradené alebo zrušené plány sa
+zaznamenajú s dostupnou čiastočnou telemetriou.
 
-Dashboard zobrazuje tabuľku výsledkov plánov na konci sekcie História, kde je
-možné porovnať modelované odhady s nameraným dopadu na náklady. Táto spätná väzba
-pomáha overiť správnosť modelu a zaistiť, že úspory v praxi zodpovedajú teórii.
-API `/api/history` vracia záznamy vrátane `plan_results` udalostí s detailmi.
+Rozkliknuteľný výsledok porovnáva predpoveď so skutočnými päťminútovými
+meraniami: výrobu a spotrebu počíta integráciou nameraného výkonu, import a
+náklady odvodzuje z prírastkov počítadla importu a tarify a SOC preberá z
+telemetrie. Zobrazuje aj pokrytie meraním, aby bolo viditeľné, keď chýbajú
+vzorky. „Self-use“ v porovnaní je kontrafaktuálna simulácia s nameranou výrobou,
+spotrebou, počiatočným SOC a tarifou; menič nemôže súčasne merať oba režimy.
+Rozdiel sa porovnáva len na intervaloch s použiteľnou telemetriou a je preto
+modelovaný odhad, nie priamo nameraná ani garantovaná úspora. Výsledky plánov
+načítava API `/api/optimization-results`;
+udalosti a posledné telemetrické vzorky zostávajú dostupné cez `/api/history`.
 Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
 `chargePower` a `disChargePower`; vybíjací výkon sa ukazuje ako kladná veľkosť,
 aj keď API posiela zápornú hodnotu. Zobrazuje tiež kapacitu batérie,

@@ -62,6 +62,17 @@ class HistoryStore:
                     actual_battery_discharge_kwh REAL,
                     completed_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS optimization_plans (
+                    plan_id TEXT PRIMARY KEY,
+                    plan_date TEXT NOT NULL,
+                    horizon_start TEXT NOT NULL,
+                    horizon_end TEXT NOT NULL,
+                    plan_status TEXT NOT NULL,
+                    forecast_json TEXT NOT NULL,
+                    actual_json TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
                 """
             )
 
@@ -412,3 +423,126 @@ class HistoryStore:
                     (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def record_optimization_plan(self, plan_id, forecast):
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValueError("Optimization plan ID must be a non-empty string.")
+        if not isinstance(forecast, dict):
+            raise ValueError("Optimization forecast must be an object.")
+        plan_date = forecast.get("plan_date")
+        horizon_start = forecast.get("horizon_start")
+        horizon_end = forecast.get("horizon_end")
+        try:
+            start = datetime.fromisoformat(horizon_start)
+            end = datetime.fromisoformat(horizon_end)
+        except (TypeError, ValueError):
+            raise ValueError("Optimization forecast must include a valid horizon.") from None
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            raise ValueError("Optimization forecast horizon must be timezone-aware and increasing.")
+        if not isinstance(plan_date, str) or not plan_date:
+            raise ValueError("Optimization forecast must include its plan date.")
+        forecast_json = json.dumps(
+            forecast,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO optimization_plans (
+                    plan_id, plan_date, horizon_start, horizon_end, plan_status,
+                    forecast_json, actual_json, created_at
+                ) VALUES (?, ?, ?, ?, 'pending', ?, NULL, ?)
+                """,
+                (
+                    plan_id,
+                    plan_date,
+                    start.isoformat(timespec="minutes"),
+                    end.isoformat(timespec="minutes"),
+                    forecast_json,
+                    created_at,
+                ),
+            )
+
+    def update_optimization_plan_result(self, plan_id, plan_status, actual):
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValueError("Optimization plan ID must be a non-empty string.")
+        if not isinstance(plan_status, str) or not plan_status:
+            raise ValueError("Optimization plan status must be a non-empty string.")
+        actual_json = json.dumps(
+            actual,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE optimization_plans
+                SET plan_status = ?, actual_json = ?, completed_at = ?
+                WHERE plan_id = ?
+                """,
+                (plan_status, actual_json, completed_at, plan_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Optimization plan {plan_id} was not found.")
+
+    def get_optimization_plans(self, limit=30):
+        limit = max(1, min(200, int(limit)))
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT plan_id, plan_date, horizon_start, horizon_end,
+                       plan_status, forecast_json, actual_json, created_at,
+                       completed_at
+                FROM optimization_plans
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                **{
+                    key: row[key]
+                    for key in (
+                        "plan_id",
+                        "plan_date",
+                        "horizon_start",
+                        "horizon_end",
+                        "plan_status",
+                        "created_at",
+                        "completed_at",
+                    )
+                },
+                "forecast": json.loads(row["forecast_json"]),
+                "actual": json.loads(row["actual_json"])
+                if row["actual_json"] is not None
+                else None,
+            }
+            for row in rows
+        ]
+
+    def telemetry_for_period(self, start, end):
+        start_at = datetime.fromisoformat(start)
+        end_at = datetime.fromisoformat(end)
+        if start_at.tzinfo is None or end_at.tzinfo is None or end_at <= start_at:
+            raise ValueError("Telemetry range must be timezone-aware and increasing.")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT sampled_at, generation_kw, consumption_kw, battery_soc,
+                       observed_grid_import_delta_kwh,
+                       observed_grid_import_cost_with_aid_eur,
+                       observed_grid_import_cost_without_aid_eur
+                FROM telemetry
+                WHERE julianday(sampled_at) >= julianday(?) - (15.0 / 1440.0)
+                  AND julianday(sampled_at) <= julianday(?) + (15.0 / 1440.0)
+                ORDER BY julianday(sampled_at), id
+                """,
+                (start_at.isoformat(), end_at.isoformat()),
+            ).fetchall()
+        return [dict(row) for row in rows]

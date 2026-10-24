@@ -46,6 +46,8 @@
     .hint { margin: 14px 0 0; font-size: .9rem; line-height: 1.5; }
     .estimate { margin: 4px 0 0; color: #c5d4de; font-size: .9rem; }
     .table-wrap { margin-top: 12px; max-width: 100%; overflow-x: auto; }
+    .plan-result { margin-top: 12px; padding: 12px; border: 1px solid #283d4d; border-radius: 10px; }
+    .plan-result > summary { cursor: pointer; color: #c5d4de; font-weight: 650; }
     table { width: 100%; border-collapse: collapse; font-size: .88rem; white-space: nowrap; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #283d4d; text-align: right; }
     th:first-child, td:first-child { text-align: left; }
@@ -90,8 +92,8 @@
       <article class="card"><div class="label">Energia z batérie</div><div class="value" id="daily-battery-discharge">—</div></article>
     </section>
     <section class="controls" aria-labelledby="optimization-title">
-      <h2 id="optimization-title">Celodenný plán podľa počasia a tarify 4T</h2>
-      <p class="hint">Plán porovnáva náklady po hodinách počas celého nasledujúceho dňa. Po potvrdení appka v odporúčanom čase zapne nabíjanie a po skončení okna vráti menič do Self-use; server musí byť počas plánu dostupný.</p>
+      <h2 id="optimization-title">Plán podľa počasia a tarify 4T</h2>
+      <p class="hint">Plán začína od najbližšej celej hodiny a pokrýva zvolený priebežný horizont. Po potvrdení appka v odporúčanom čase zapne nabíjanie a po každom okne vráti menič do Self-use; server musí byť počas plánu dostupný.</p>
       <div class="control-row">
         <label for="optimization-location">Obec</label>
         <input id="optimization-location" type="text" maxlength="100" value="Jacovce" autocomplete="address-level2">
@@ -109,6 +111,12 @@
       </div>
       <div class="control-row">
         <label><input id="optimization-aid" type="checkbox" checked> Započítať energopomoc</label>
+        <label for="optimization-horizon">Horizont</label>
+        <select id="optimization-horizon">
+          <option value="12">12 hodín</option>
+          <option value="24" selected>24 hodín</option>
+          <option value="36">36 hodín</option>
+        </select>
         <button id="calculate-optimization" type="button">Vypočítať plán</button>
       </div>
       <div id="optimization-result" class="hint" role="status" aria-live="polite">Zadaj lokalitu a parametre, potom vypočítaj odporúčanie.</div>
@@ -149,13 +157,13 @@
     </section>
     <section class="controls" aria-labelledby="history-title">
       <h2 id="history-title">História a merania</h2>
-      <p class="hint">Menič sa zaznamenáva každých 5 minút. Náklady zo siete sa odhadujú z prírastkov denných počítadiel a zobrazujú sa s energopomocou aj bez nej; úspora z optimalizácie je modelovaný odhad, nie nameraná úspora.</p>
+      <p class="hint">Menič sa zaznamenáva každých 5 minút. Import a náklady sa odhadujú z prírastkov počítadiel a tarify. Úspora oproti Self-use je vždy kontrafaktuálny model, pretože menič v danom čase nemôže súčasne bežať v oboch režimoch.</p>
       <div class="control-row">
         <button id="refresh-history" type="button">Obnoviť históriu</button>
         <span id="history-status" class="label" role="status">Načítavam históriu…</span>
       </div>
       <h3 class="section-title">Výsledky plánov</h3>
-      <p class="hint">Po skončení každého plánu sa zaznamenajú skutočné náklady za nabíjanie. Porovnanie s odhadmi pomáha zlepšiť budúce optimalizácie.</p>
+      <p class="hint">Po skončení plánovacieho horizontu sa dá rozkliknúť predpoveď oproti telemetrii: výroba, spotreba, import, náklady a SOC. Self-use je simulovaný proti nameranej výrobe a spotrebe; pokrytie telemetrie ukazuje úplnosť merania.</p>
       <div id="plan-results" class="table-wrap"></div>
       <h3 class="section-title">Udalosti a plány</h3>
       <div id="event-history" class="table-wrap"></div>
@@ -329,7 +337,8 @@
         pv_capacity_kwp: Number(document.getElementById("optimization-pv").value),
         summer_consumption_kwh: Number(document.getElementById("optimization-summer").value),
         winter_consumption_kwh: Number(document.getElementById("optimization-winter").value),
-        energy_aid: document.getElementById("optimization-aid").checked
+        energy_aid: document.getElementById("optimization-aid").checked,
+        planning_horizon_hours: Number(document.getElementById("optimization-horizon").value)
       };
     }
 
@@ -355,6 +364,9 @@
         }
         if (typeof saved.energy_aid === "boolean") {
           document.getElementById("optimization-aid").checked = saved.energy_aid;
+        }
+        if ([12, 24, 36].includes(Number(saved.planning_horizon_hours))) {
+          document.getElementById("optimization-horizon").value = String(saved.planning_horizon_hours);
         }
       } catch (error) {
         console.warn("Saved optimization settings could not be read.", error);
@@ -404,38 +416,104 @@
       return `${Number(value).toLocaleString("sk-SK", { maximumFractionDigits: 2 })}${unit ? ` ${unit}` : ""}`;
     }
 
+    function renderOptimizationResults(plans) {
+      const container = document.getElementById("plan-results");
+      container.replaceChildren();
+      if (plans.length === 0) {
+        container.textContent = "Zatiaľ nie sú uložené žiadne plány.";
+        return;
+      }
+
+      const statusNames = {
+        pending: "čaká",
+        charging: "nabíja",
+        evaluating: "vyhodnocuje telemetriu",
+        completed: "vyhodnotený",
+        cancelled: "zrušený",
+        replaced: "nahradený",
+        failed: "zlyhal"
+      };
+      for (const plan of plans) {
+        const forecast = plan.forecast || {};
+        const actual = plan.actual;
+        const details = document.createElement("details");
+        details.className = "plan-result";
+        const summary = document.createElement("summary");
+        const start = plan.horizon_start
+          ? new Date(plan.horizon_start).toLocaleString("sk-SK")
+          : "—";
+        const end = plan.horizon_end
+          ? new Date(plan.horizon_end).toLocaleString("sk-SK")
+          : "—";
+        summary.textContent = `${plan.plan_date || "Plán"} · ${statusNames[plan.plan_status] || plan.plan_status} · ${start} – ${end}`;
+        details.append(summary);
+
+        appendOptimizationLine(
+          details,
+          `Predpoveď: náklady s plánom ${historyNumber(forecast.cost_with_plan_eur, "€")}; Self-use ${historyNumber(forecast.cost_self_use_eur, "€")}; odhadovaná úspora vrátane zostatkovej energie ${historyNumber(forecast.estimated_savings_eur, "€")}.`
+        );
+        if (actual) {
+          appendOptimizationLine(
+            details,
+            `Telemetria: pokrytie ${historyNumber(actual.telemetry_coverage_percent, "%")} zvoleného horizontu, ${actual.telemetry_sample_count || 0} meraní; výroba ${historyNumber(actual.actual_generation_kwh, "kWh")}, spotreba ${historyNumber(actual.actual_consumption_kwh, "kWh")}, import ${historyNumber(actual.actual_grid_import_kwh, "kWh")}, náklady podľa počítadla a tarify ${historyNumber(actual.actual_cost_with_aid_eur, "€")}.`,
+            true
+          );
+          appendOptimizationLine(
+            details,
+            `Self-use kontrafaktuálna simulácia: ${historyNumber(actual.self_use_counterfactual_cost_eur, "€")} pri pokrytí ${historyNumber(actual.self_use_simulation_coverage_percent, "%")}; skutočný náklad na rovnakých intervaloch ${historyNumber(actual.actual_cost_on_simulation_coverage_eur, "€")}; odhadovaný rozdiel oproti Self-use ${historyNumber(actual.estimated_savings_vs_self_use_eur, "€")}.`
+          );
+
+          const actualByTime = new Map(
+            (actual.hourly || []).map(hour => [hour.time, hour])
+          );
+          const rows = (forecast.hourly_plan || []).map(hour => {
+            const measured = actualByTime.get(hour.time) || {};
+            return [
+              new Date(hour.time).toLocaleString("sk-SK", {
+                day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"
+              }),
+              `${historyNumber(hour.solar_kwh)} / ${historyNumber(measured.solar_kwh)}`,
+              `${historyNumber(hour.consumption_kwh)} / ${historyNumber(measured.consumption_kwh)}`,
+              `${historyNumber(hour.grid_import_kwh)} / ${historyNumber(measured.grid_import_kwh)}`,
+              `${historyNumber(hour.cost_eur)} / ${historyNumber(measured.cost_eur, "€")}`,
+              `${historyNumber(hour.soc_end, "%")} / ${historyNumber(measured.soc_end, "%")}`
+            ];
+          });
+          const tableContainer = document.createElement("div");
+          tableContainer.className = "table-wrap";
+          appendHistoryTable(
+            tableContainer,
+            ["Čas", "FVE pred / skutočná kWh", "Spotreba pred / skutočná kWh", "Import pred / skutočný kWh", "Náklad pred / skutočný €", "SOC pred / skutočný"],
+            rows
+          );
+          details.append(tableContainer);
+        } else {
+          appendOptimizationLine(
+            details,
+            plan.plan_status === "evaluating"
+              ? "Nabíjacie okná skončili; zber telemetrie pokračuje do konca horizontu."
+              : "Skutočné výsledky sa zobrazia po vyhodnotení plánovacieho horizontu."
+          );
+        }
+        container.append(details);
+      }
+    }
+
     async function refreshHistory() {
       const status = document.getElementById("history-status");
       status.textContent = "Načítavam históriu…";
       try {
-        const response = await fetch("/api/history", { cache: "no-store" });
+        const [response, plansResponse] = await Promise.all([
+          fetch("/api/history", { cache: "no-store" }),
+          fetch("/api/optimization-results", { cache: "no-store" })
+        ]);
         const history = await response.json();
+        const planResult = await plansResponse.json();
         if (!response.ok) throw new Error(history.error || `Chyba HTTP ${response.status}`);
-        
-        const planResults = history.events
-          .filter(event => event.event_type === "plan_results")
-          .map(event => {
-            const details = event.details || {};
-            return [
-              details.plan_date || "—",
-              new Date(event.created_at).toLocaleString("sk-SK").split(" ")[1] || "—",
-              historyNumber(details.estimated_savings_eur, "€"),
-              historyNumber(details.actual_grid_import_kwh, "kWh"),
-              historyNumber(details.actual_cost_with_aid_eur, "€"),
-              historyNumber(details.actual_cost_without_aid_eur, "€")
-            ];
-          });
-        
-        if (planResults.length > 0) {
-          appendHistoryTable(
-            document.getElementById("plan-results"),
-            ["Dátum plánu", "Zaznamenané", "Modelovaná úspora €", "Skutočný import kWh", "Cena s pomocou €", "Cena bez pomoci €"],
-            planResults
-          );
-        } else {
-          document.getElementById("plan-results").textContent = "Zatiaľ nie sú dostupné výsledky žiadneho plánu.";
-        }
-        
+        if (!plansResponse.ok) throw new Error(planResult.error || `Chyba HTTP ${plansResponse.status}`);
+
+        renderOptimizationResults(planResult.plans || []);
+
         const eventRows = history.events.map(event => {
           const details = event.details || {};
           const values = [];
@@ -492,14 +570,17 @@
       
       // Header with basic info
       const windows = plan.windows || [];
-      appendOptimizationLine(result, `Plán pre ${plan.plan_date}: ${windows.length} nabíjacích okien`);
+      appendOptimizationLine(
+        result,
+        `Plán pre ${plan.plan_date}: ${windows.length} nabíjacích okien, horizont ${new Date(plan.horizon_start).toLocaleString("sk-SK")} – ${new Date(plan.horizon_end).toLocaleString("sk-SK")}`
+      );
       
       if (plan.consumption_history_sync_warning) {
         appendOptimizationLine(result, plan.consumption_history_sync_warning);
       }
       
       if (windows.length === 0) {
-        appendOptimizationLine(result, "Žiadne lacné okná na nabíjanie v tomto dni (všetky tarify rovnaké alebo príliš vysoké).", true);
+        appendOptimizationLine(result, "V zvolenom horizonte nie sú odporúčané nabíjacie okná (ceny alebo stav batérie nabíjanie neodôvodňujú).", true);
         document.getElementById("apply-optimization").hidden = true;
         return;
       }
@@ -517,7 +598,7 @@
       
       appendOptimizationLine(
         result,
-        `Optimalizácia: spolu ${formatValue(totalCharge, "kWh")}; náklady do 06:00 s plánom ${formatValue(totalCost, "€")} (Self-use: ${formatValue(costWithoutPlan, "€")}), rozdiel nákladov ${formatValue(cashSavings, "€")}; odhadovaná úspora vrátane hodnoty energie zostávajúcej v batérii ${formatValue(estimatedSavings, "€")}.`,
+        `Optimalizácia: spolu ${formatValue(totalCharge, "kWh")}; náklady počas horizontu s plánom ${formatValue(totalCost, "€")} (Self-use: ${formatValue(costWithoutPlan, "€")}), rozdiel nákladov ${formatValue(cashSavings, "€")}; odhadovaná úspora vrátane hodnoty energie zostávajúcej v batérii ${formatValue(estimatedSavings, "€")}.`,
         true
       );
       
@@ -621,7 +702,8 @@
             pending: `Naplánované: ${windows.length} nabíjacích okien v plánovacom horizonte.`,
             charging: `Prebieha nabíjanie v okne ${state.current_window_index + 1}/${windows.length}.`,
             transitioning: `Prechod medzi oknami; appka sa vracia do Self-use.`,
-            completed: `Všetky okná naplánu boli ukončené a vrátené do Self-use.`,
+            evaluating: `Nabíjanie skončilo; telemetria sa vyhodnocuje do ${new Date(state.horizon_end).toLocaleString("sk-SK")}.`,
+            completed: `Všetky okná plánu skončili a porovnanie predpovede s telemetriou je hotové.`,
             cancelled: "Plán bol zrušený ručným prepnutím do Self-use.",
             failed: `Plán zlyhal: ${state.error || "vyžaduje sa kontrola meniča."}`,
             idle: "Nie je uložený žiadny aktívny plán."
@@ -740,6 +822,7 @@
             windows: windows,
             plan_date: optimizationPlan.plan_date,
             generated_at: optimizationPlan.generated_at,
+            plan_snapshot: optimizationPlan,
             confirmed: true
           })
         });
