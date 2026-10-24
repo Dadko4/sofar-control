@@ -26,7 +26,9 @@ from run import (
     estimate_daily_consumption,
     estimate_hourly_consumption,
     get_solar_forecast,
+    get_scheduled_plan_state,
     load_env_file,
+    optimize_day,
     optimize_night_charge,
     parse_station_status,
     seasonal_daily_consumption,
@@ -190,6 +192,46 @@ class OptimizationTests(unittest.TestCase):
         self.assertEqual(cloudy["recommended_target_soc"], 95)
         self.assertGreaterEqual(cloudy["estimated_savings_eur"], 0)
 
+    def test_multi_window_optimizer_includes_next_morning_and_daily_consumption(self):
+        start = datetime(2026, 10, 24, tzinfo=timezone.utc)
+        forecast = {
+            "location": "Jacovce",
+            "hourly": [
+                {
+                    "time": (start + timedelta(hours=hour)).isoformat(),
+                    "shortwave_radiation": 0,
+                }
+                for hour in range(72)
+            ],
+        }
+        plan = optimize_day(
+            self.sample_status(soc=50),
+            forecast,
+            7,
+            24,
+            24,
+            True,
+            now=datetime(2026, 10, 24, 20, 47, tzinfo=ZoneInfo(TIMEZONE)),
+        )
+
+        times = [datetime.fromisoformat(hour["time"]) for hour in plan["hourly_plan"]]
+        self.assertEqual(len(times), 10)
+        self.assertEqual(
+            sum(moment.date().isoformat() == "2026-10-24" for moment in times),
+            3,
+        )
+        self.assertEqual(
+            sum(moment.date().isoformat() == "2026-10-25" for moment in times),
+            7,
+        )
+        self.assertAlmostEqual(
+            sum(hour["consumption_kwh"] for hour in plan["hourly_plan"]),
+            9.72,
+            places=2,
+        )
+        self.assertIn("cash_savings_eur", plan)
+        self.assertEqual(times[-1].strftime("%Y-%m-%d %H:%M"), "2026-10-25 05:00")
+
     def test_optimizer_respects_nine_hour_night_during_dst_fallback(self):
         start = datetime(2026, 10, 24, tzinfo=timezone.utc)
         forecast = {
@@ -305,6 +347,35 @@ class OptimizationTests(unittest.TestCase):
         self.assertEqual(forecast["location"], "Jacovce")
         self.assertEqual(forecast["hourly"][0]["shortwave_radiation"], 125.5)
         self.assertEqual(request.call_count, 2)
+
+
+class ScheduledPlanStateTests(unittest.TestCase):
+    def test_active_multi_window_plan_is_displayed_instead_of_legacy_state(self):
+        multi_state = {
+            "status": "pending",
+            "windows_queue": [{"charge_start": "2026-10-24T22:00+02:00"}],
+        }
+        legacy_state = {"status": "pending", "plan": {"charge_start": "2026-10-25T05:50+01:00"}}
+        with patch("run.MULTI_WINDOW_SCHEDULER") as multi_scheduler, patch(
+            "run.SCHEDULED_CHARGE"
+        ) as legacy_scheduler:
+            multi_scheduler.get_state.return_value = multi_state
+            legacy_scheduler.get_state.return_value = legacy_state
+            legacy_scheduler.ACTIVE_STATUSES = {"pending", "charging"}
+
+            self.assertEqual(get_scheduled_plan_state(), multi_state)
+
+    def test_legacy_plan_remains_visible_when_multi_window_scheduler_is_idle(self):
+        multi_state = {"status": "idle", "windows_queue": []}
+        legacy_state = {"status": "pending", "plan": {"charge_start": "2026-10-25T05:50+01:00"}}
+        with patch("run.MULTI_WINDOW_SCHEDULER") as multi_scheduler, patch(
+            "run.SCHEDULED_CHARGE"
+        ) as legacy_scheduler:
+            multi_scheduler.get_state.return_value = multi_state
+            legacy_scheduler.get_state.return_value = legacy_state
+            legacy_scheduler.ACTIVE_STATUSES = {"pending", "charging"}
+
+            self.assertEqual(get_scheduled_plan_state(), legacy_state)
 
 
 class ScheduledChargeTests(unittest.TestCase):

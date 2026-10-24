@@ -508,11 +508,16 @@
       const totalCharge = windows.reduce((sum, w) => sum + (Number(w.recommended_grid_charge_kwh) || 0), 0);
       const totalCost = plan.cost_with_plan_eur || 0;
       const costWithoutPlan = plan.cost_self_use_eur || 0;
-      const savings = costWithoutPlan - totalCost;
+      const cashSavings = Number.isFinite(plan.cash_savings_eur)
+        ? plan.cash_savings_eur
+        : costWithoutPlan - totalCost;
+      const estimatedSavings = Number.isFinite(plan.estimated_savings_eur)
+        ? plan.estimated_savings_eur
+        : cashSavings;
       
       appendOptimizationLine(
         result,
-        `Optimalizácia: spolu ${formatValue(totalCharge, "kWh")}, odhadovaná cena ${formatValue(totalCost, "€")} (bez plánu: ${formatValue(costWithoutPlan, "€")}); úspora ${formatValue(savings, "€")}.`,
+        `Optimalizácia: spolu ${formatValue(totalCharge, "kWh")}; náklady do 06:00 s plánom ${formatValue(totalCost, "€")} (Self-use: ${formatValue(costWithoutPlan, "€")}), rozdiel nákladov ${formatValue(cashSavings, "€")}; odhadovaná úspora vrátane hodnoty energie zostávajúcej v batérii ${formatValue(estimatedSavings, "€")}.`,
         true
       );
       
@@ -559,7 +564,7 @@
       for (const hour of plan.hourly_plan) {
         const row = document.createElement("tr");
         const values = [
-          new Date(hour.time).toLocaleTimeString("sk-SK", { hour: "2-digit", minute: "2-digit" }),
+          new Date(hour.time).toLocaleString("sk-SK", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }),
           Number(hour.tariff_eur_per_kwh).toLocaleString("sk-SK", { minimumFractionDigits: 3, maximumFractionDigits: 3 }),
           Number(hour.solar_kwh).toLocaleString("sk-SK", { maximumFractionDigits: 2 }),
           Number(hour.consumption_kwh).toLocaleString("sk-SK", { maximumFractionDigits: 2 }),
@@ -613,7 +618,7 @@
         } else if (windows.length > 0) {
           // Multi-window display
           const statusText = {
-            pending: `Naplánované: ${windows.length} okien nabíjania dnes.`,
+            pending: `Naplánované: ${windows.length} nabíjacích okien v plánovacom horizonte.`,
             charging: `Prebieha nabíjanie v okne ${state.current_window_index + 1}/${windows.length}.`,
             transitioning: `Prechod medzi oknami; appka sa vracia do Self-use.`,
             completed: `Všetky okná naplánu boli ukončené a vrátené do Self-use.`,
@@ -722,7 +727,7 @@
         return `${i + 1}. ${st}–${et} (${w.recommended_target_soc}%)`;
       }).join("\n");
       
-      const message = `Uložiť plán: appka zapne nabíjanie v ${windowCount} oknách dnes:\n\n${windowSummary}\n\nPo každom okne prepne menič na Self-use. Appka/server musia počas plánu bežať.`;
+      const message = `Uložiť plán: appka zapne nabíjanie v ${windowCount} oknách plánovacieho horizontu:\n\n${windowSummary}\n\nPo každom okne prepne menič na Self-use. Appka/server musia počas plánu bežať.`;
       if (!window.confirm(`${message}\n\nPotvrdením povolíš appke odoslať príkazy do meniča v naplánovaných časoch.`)) return;
       
       const button = document.getElementById("apply-optimization");

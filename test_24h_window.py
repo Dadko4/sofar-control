@@ -1,4 +1,4 @@
-"""Test 24-hour planning window (from now until 06:00 next day)."""
+"""Test planning horizon through 06:00 on the next local day."""
 
 from datetime import datetime, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo
@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 TIMEZONE = "Europe/Bratislava"
 
 def test_plan_date_window():
-    """Test that plan_date calculation gives 24-hour window until 06:00."""
+    """Test that the planning horizon ends at 06:00 on the next local day."""
     
     test_cases = [
         # (current_time, expected_plan_date, expected_horizon_end_time)
