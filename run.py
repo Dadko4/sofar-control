@@ -88,6 +88,7 @@ ALLOWED_ORIGINS = {
 WEB_ROOT = Path(__file__).parent / "web"
 DATA_DIR = Path(os.environ.get("SOFAR_DATA_DIR", str(Path(__file__).parent / "data")))
 SCHEDULED_PLAN_FILE = DATA_DIR / "scheduled-plan.json"
+MULTI_WINDOW_STATE_FILE = DATA_DIR / "multi_window_state.json"
 REQUEST_TIMEOUT = 15
 COMMAND_TIMEOUT = 60
 SOCKET_URL = "https://eu-socket.sofarcloud.com"
@@ -2761,7 +2762,7 @@ SCHEDULED_CHARGE = ScheduledChargeController(
 )
 MULTI_WINDOW_SCHEDULER = MultiWindowScheduler(
     CLIENT,
-    Path(tempfile.gettempdir()) / "multi_window_state.json",
+    MULTI_WINDOW_STATE_FILE,
     MODE_CONTROL_LOCK,
     lambda: DISCHARGE_WATCHDOG.get_state()["active"],
     TIMEZONE,
