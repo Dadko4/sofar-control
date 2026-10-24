@@ -115,6 +115,7 @@
       <button id="apply-optimization" type="button" disabled hidden>Naplánovať odporúčané nabíjanie</button>
       <div id="hourly-plan" class="table-wrap" hidden></div>
       <p id="scheduled-plan-status" class="hint" role="status" aria-live="polite">Načítavam uložený plán…</p>
+      <p id="live-metrics" class="hint" role="status" aria-live="polite"></p>
       <p class="hint">4T: noc 22:00–06:00, predpoludnie 09:00–13:00, popoludnie 13:00–19:00, ranná/večerná špička 06:00–09:00 a 19:00–22:00. Cez víkend sa ceny znižujú o 12 %. Fixný poplatok 1,50 € mesačne sa nemení podľa nabíjania a vo výpočte nie je zahrnutý.</p>
       <p class="hint">Predpoveď počasia: <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open-Meteo</a>.</p>
     </section>
@@ -585,28 +586,78 @@
         const state = await response.json();
         if (!response.ok) throw new Error(state.error || `Chyba HTTP ${response.status}`);
         element.classList.remove("error");
-        if (!state.plan) {
+        if (!state.plan && (!state.windows_queue || state.windows_queue.length === 0)) {
           element.textContent = "Nie je uložený žiadny aktívny plán.";
+          document.getElementById("live-metrics").textContent = "";
           return;
         }
         const plan = state.plan;
-        const start = new Date(plan.charge_start).toLocaleString("sk-SK");
-        const end = new Date(plan.charge_end).toLocaleString("sk-SK");
-        const statusText = {
-          pending: `Naplánované: appka zapne nabíjanie ${start} a o ${end} vráti menič do Self-use.`,
-          charging: `Prebieha plánované nabíjanie do ${end}; potom appka prepne na Self-use.`,
-          returning_to_self_use: "Plánované nabíjanie skončilo; appka sa pokúša vrátiť menič do Self-use.",
-          completed: `Plán dokončený; menič bol vrátený do Self-use. ${start} – ${end}.`,
-          cancelled: "Plán bol zrušený ručným prepnutím do Self-use.",
-          failed: `Plán zlyhal: ${state.error || "vyžaduje sa kontrola meniča."}`,
-          expired: `Plán sa nestihol spustiť: ${state.error || "časové okno uplynulo"}`,
-          idle: "Nie je uložený žiadny aktívny plán."
-        };
-        element.textContent = `${statusText[state.status] || `Stav plánu: ${state.status}`}${state.history_warning ? ` ${state.history_warning}` : ""}`;
-        element.classList.toggle("error", ["failed", "expired"].includes(state.status));
+        const windows = state.windows_queue || [];
+        
+        if (plan) {
+          // Legacy single-plan display
+          const start = new Date(plan.charge_start).toLocaleString("sk-SK");
+          const end = new Date(plan.charge_end).toLocaleString("sk-SK");
+          const statusText = {
+            pending: `Naplánované: appka zapne nabíjanie ${start} a o ${end} vráti menič do Self-use.`,
+            charging: `Prebieha plánované nabíjanie do ${end}; potom appka prepne na Self-use.`,
+            returning_to_self_use: "Plánované nabíjanie skončilo; appka sa pokúša vrátiť menič do Self-use.",
+            completed: `Plán dokončený; menič bol vrátený do Self-use. ${start} – ${end}.`,
+            cancelled: "Plán bol zrušený ručným prepnutím do Self-use.",
+            failed: `Plán zlyhal: ${state.error || "vyžaduje sa kontrola meniča."}`,
+            expired: `Plán sa nestihol spustiť: ${state.error || "časové okno uplynulo"}`,
+            idle: "Nie je uložený žiadny aktívny plán."
+          };
+          element.textContent = `${statusText[state.status] || `Stav plánu: ${state.status}`}${state.history_warning ? ` ${state.history_warning}` : ""}`;
+          element.classList.toggle("error", ["failed", "expired"].includes(state.status));
+        } else if (windows.length > 0) {
+          // Multi-window display
+          const statusText = {
+            pending: `Naplánované: ${windows.length} okien nabíjania dnes.`,
+            charging: `Prebieha nabíjanie v okne ${state.current_window_index + 1}/${windows.length}.`,
+            transitioning: `Prechod medzi oknami; appka sa vracia do Self-use.`,
+            completed: `Všetky okná naplánu boli ukončené a vrátené do Self-use.`,
+            cancelled: "Plán bol zrušený ručným prepnutím do Self-use.",
+            failed: `Plán zlyhal: ${state.error || "vyžaduje sa kontrola meniča."}`,
+            idle: "Nie je uložený žiadny aktívny plán."
+          };
+          element.textContent = statusText[state.status] || `Stav plánu: ${state.status}`;
+          element.classList.toggle("error", ["failed"].includes(state.status));
+          
+          // Show live metrics if charging
+          if (state.status === "charging" || state.status === "transitioning") {
+            await refreshLiveMetrics();
+          }
+        }
       } catch (error) {
         element.textContent = `Stav naplánovaného nabíjania sa nedá načítať: ${error.message}`;
         element.classList.add("error");
+      }
+    }
+
+    async function refreshLiveMetrics() {
+      const element = document.getElementById("live-metrics");
+      if (!element) return;
+      
+      try {
+        const response = await fetch("/api/live-metrics", { cache: "no-store" });
+        const metrics = await response.json();
+        if (!response.ok) throw new Error(metrics.error);
+        
+        if (!metrics.is_active) {
+          element.textContent = "";
+          return;
+        }
+        
+        const costEur = (metrics.plan_cost_eur || 0).toLocaleString("sk-SK", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        const selfUseEur = (metrics.self_use_cost_eur || 0).toLocaleString("sk-SK", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        const savingsEur = (metrics.savings_eur || 0).toLocaleString("sk-SK", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        const gridKwh = (metrics.grid_import_kwh || 0).toLocaleString("sk-SK", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        const windowPct = (metrics.time_in_window_percent || 0).toLocaleString("sk-SK", {minimumFractionDigits: 0, maximumFractionDigits: 0});
+        
+        element.textContent = `Live: ${gridKwh} kWh za €${costEur} (self-use €${selfUseEur}, úspora €${savingsEur}); okno ${windowPct}%`;
+      } catch (error) {
+        element.textContent = `Live metriky: ${error.message}`;
       }
     }
 

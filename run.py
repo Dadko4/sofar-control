@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import socketio
 
 from history import HistoryStore
+from live_metrics import calculate_live_metrics
 from multi_window_scheduler import MultiWindowScheduler
 from planner import BatteryModel, optimize_windows
 
@@ -2765,6 +2766,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, DISCHARGE_WATCHDOG.get_state())
         elif self.path == "/api/optimization-plan":
             self._send_json(200, SCHEDULED_CHARGE.get_state())
+        elif self.path == "/api/live-metrics":
+            try:
+                metrics = calculate_live_metrics(HISTORY_STORE, MULTI_WINDOW_SCHEDULER, TIMEZONE)
+                self._send_json(200, metrics)
+            except Exception as error:
+                LOGGER.exception("Could not calculate live metrics: %s", error)
+                self._send_json(500, {"error": "Could not calculate live metrics."})
         elif self.path == "/api/history":
             if HISTORY_STORE is None:
                 self._send_json(503, {"error": "History logging is not initialized."})
