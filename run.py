@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import socketio
 
 from history import HistoryStore
+from planner import BatteryModel, optimize_windows
 
 
 def load_env_file(path):
@@ -541,6 +542,186 @@ def validate_optimization_settings(settings):
         "summer_consumption_kwh": summer_consumption_kwh,
         "winter_consumption_kwh": winter_consumption_kwh,
         "energy_aid": energy_aid,
+    }
+
+
+def optimize_day(
+    status,
+    forecast,
+    pv_capacity_kwp,
+    summer_consumption_kwh,
+    winter_consumption_kwh,
+    energy_aid,
+    now=None,
+    history_store=None,
+):
+    """Compute multiple charging windows for the target day using planner.optimize_windows."""
+    
+    try:
+        pv_capacity_kwp = float(pv_capacity_kwp)
+        summer_consumption_kwh = float(summer_consumption_kwh)
+        winter_consumption_kwh = float(winter_consumption_kwh)
+        soc = float(status["metrics"]["battery_soc"])
+        capacity = float(status["battery_capacity"]["value"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Valid battery SOC, capacity, PV and consumption values are required.") from None
+    
+    if not math.isfinite(pv_capacity_kwp) or not 0.1 <= pv_capacity_kwp <= 100:
+        raise ValueError("PV capacity must be between 0.1 and 100 kWp.")
+    if any(
+        not math.isfinite(value) or not 1 <= value <= 100
+        for value in (summer_consumption_kwh, winter_consumption_kwh)
+    ):
+        raise ValueError("Seasonal consumption must be between 1 and 100 kWh per day.")
+    if not isinstance(energy_aid, bool):
+        raise ValueError("Energy-aid setting must be true or false.")
+    if not math.isfinite(soc) or not 0 <= soc <= 100:
+        raise ValueError("Current battery SOC is invalid.")
+    if not math.isfinite(capacity) or capacity <= 0:
+        raise ValueError("Battery capacity must be positive.")
+    if not isinstance(forecast, dict) or not isinstance(forecast.get("hourly"), list):
+        raise ForecastError("Hourly solar forecast is missing.")
+    
+    try:
+        local_now = now or datetime.now(ZoneInfo(TIMEZONE))
+        if local_now.tzinfo is None:
+            local_now = local_now.replace(tzinfo=ZoneInfo(TIMEZONE))
+        local_now = local_now.astimezone(ZoneInfo(TIMEZONE))
+    except ZoneInfoNotFoundError:
+        raise ValueError(f"Unknown SOFAR_TIMEZONE: {TIMEZONE}") from None
+    
+    current_hour_utc = local_now.astimezone(timezone.utc).replace(
+        minute=0, second=0, microsecond=0
+    )
+    if local_now.minute or local_now.second or local_now.microsecond:
+        current_hour_utc += timedelta(hours=1)
+    
+    plan_date = local_now.date() + timedelta(days=1 if local_now.hour >= 22 else 0)
+    horizon_end = datetime.combine(
+        plan_date + timedelta(days=1),
+        datetime_time(0),
+        tzinfo=ZoneInfo(TIMEZONE),
+    )
+    horizon_end_utc = horizon_end.astimezone(timezone.utc)
+    
+    consumption_estimate = estimate_daily_consumption(
+        plan_date,
+        summer_consumption_kwh,
+        winter_consumption_kwh,
+        history_store,
+    )
+    hourly_consumption_estimate = estimate_hourly_consumption(
+        plan_date,
+        consumption_estimate["value_kwh"],
+        history_store,
+    )
+    
+    forecast_hours = {}
+    for item in forecast["hourly"]:
+        if not isinstance(item, dict):
+            raise ForecastError("Hourly solar forecast contains invalid data.")
+        try:
+            hour = datetime.fromisoformat(item["time"])
+            irradiance = float(item["shortwave_radiation"])
+        except (KeyError, TypeError, ValueError):
+            raise ForecastError("Hourly solar forecast contains invalid data.") from None
+        if hour.tzinfo is None:
+            hour = hour.replace(tzinfo=timezone.utc)
+        else:
+            hour = hour.astimezone(timezone.utc)
+        hour = hour.replace(minute=0, second=0, microsecond=0)
+        if not math.isfinite(irradiance) or irradiance < 0:
+            raise ForecastError("Hourly solar forecast contains invalid radiation values.")
+        if current_hour_utc <= hour < horizon_end_utc:
+            forecast_hours[hour] = irradiance
+    
+    expected_hours = int((horizon_end_utc - current_hour_utc).total_seconds() // 3600)
+    if len(forecast_hours) < expected_hours:
+        raise ForecastError("Solar forecast does not cover the next charging cycle.")
+    
+    plan_date_hours = [
+        hour.astimezone(ZoneInfo(TIMEZONE)).hour
+        for hour in sorted(forecast_hours)
+        if hour.astimezone(ZoneInfo(TIMEZONE)).date() == plan_date
+    ]
+    
+    profile_total = sum(
+        hourly_consumption_estimate["hourly_kwh"][hour]
+        for hour in plan_date_hours
+    )
+    if profile_total <= 0:
+        raise ValueError("Hourly consumption estimate must be positive.")
+    
+    daily_profile_scale = consumption_estimate["value_kwh"] / profile_total
+    
+    initial_energy_kwh = capacity * soc / 100
+    battery = BatteryModel(
+        capacity_kwh=capacity,
+        min_energy_kwh=capacity * MINIMUM_BATTERY_SOC / 100,
+        max_energy_kwh=capacity * MAXIMUM_BATTERY_SOC / 100,
+        charge_efficiency=BATTERY_CHARGE_EFFICIENCY,
+        discharge_efficiency=BATTERY_DISCHARGE_EFFICIENCY,
+    )
+    
+    hours = []
+    for forecast_hour_utc in sorted(forecast_hours):
+        hour_local = forecast_hour_utc.astimezone(ZoneInfo(TIMEZONE))
+        if hour_local.date() != plan_date:
+            continue
+        
+        irradiance = forecast_hours[forecast_hour_utc]
+        solar_kwh = irradiance / 1000 * pv_capacity_kwp * PV_SYSTEM_EFFICIENCY
+        consumption_kwh = (
+            hourly_consumption_estimate["hourly_kwh"][hour_local.hour]
+            * daily_profile_scale
+        )
+        
+        hour_begin_utc = forecast_hour_utc
+        hour_end_utc = forecast_hour_utc + timedelta(hours=1)
+        hour_begin_local = hour_begin_utc.astimezone(ZoneInfo(TIMEZONE))
+        
+        fraction = 1.0
+        if forecast_hour_utc == current_hour_utc:
+            elapsed = (local_now - hour_begin_local).total_seconds() / 3600
+            fraction = max(0.0, 1.0 - elapsed)
+        
+        hours.append(
+            {
+                "start": forecast_hour_utc,
+                "begin": hour_begin_local,
+                "fraction": fraction,
+                "price": electricity_price(hour_local, energy_aid),
+                "solar_kwh": solar_kwh,
+                "consumption_kwh": consumption_kwh,
+            }
+        )
+    
+    if not hours:
+        raise ForecastError("No forecast hours found for the target date.")
+    
+    terminal_price = electricity_price(horizon_end, energy_aid)
+    
+    result = optimize_windows(
+        hours,
+        initial_energy_kwh,
+        battery,
+        terminal_price,
+        display_tz=ZoneInfo(TIMEZONE),
+    )
+    
+    return {
+        "location": forecast.get("location") or "",
+        "generated_at": local_now.isoformat(timespec="seconds"),
+        "plan_date": plan_date.isoformat(),
+        "windows": result["windows"],
+        "cost_with_plan_eur": result["cost_with_plan_eur"],
+        "cost_self_use_eur": result["cost_self_use_eur"],
+        "estimated_savings_eur": result["estimated_savings_eur"],
+        "hourly_plan": result["hourly_plan"],
+        "consumption_estimate_source": consumption_estimate["source"],
+        "consumption_history_days": consumption_estimate["sample_days"],
+        "hourly_consumption_profile_source": hourly_consumption_estimate["source"],
+        "hourly_consumption_profile_days": hourly_consumption_estimate["sample_days"],
     }
 
 
@@ -2799,7 +2980,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "SofarCloud historical consumption could not be downloaded; "
                         "the plan uses locally saved history or the seasonal fallback."
                     )
-            result = optimize_night_charge(
+            result = optimize_day(
                 status,
                 forecast,
                 settings["pv_capacity_kwp"],
@@ -2813,22 +2994,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             warning = record_history_event(
                 CLIENT.history_store,
                 "optimization_calculated",
-                f"Optimization calculated for {result['plan_date']}; estimated savings €{result['estimated_savings_eur']:.2f}.",
+                f"Optimization calculated for {result['plan_date']}; {len(result.get('windows', []))} charging windows; estimated savings €{result.get('estimated_savings_eur', 0):.2f}.",
                 {
                     "location": result["location"],
                     "plan_date": result["plan_date"],
-                    "recommended": result["recommended"],
-                    "recommended_grid_charge_kwh": result[
-                        "recommended_grid_charge_kwh"
-                    ],
-                    "recommended_target_soc": result["recommended_target_soc"],
-                    "estimated_cost_without_grid_charge_eur": result[
-                        "estimated_cost_without_grid_charge_eur"
-                    ],
-                    "estimated_cost_with_plan_eur": result[
-                        "estimated_cost_with_plan_eur"
-                    ],
-                    "estimated_savings_eur": result["estimated_savings_eur"],
+                    "windows_count": len(result.get("windows", [])),
+                    "cost_with_plan_eur": result.get("cost_with_plan_eur"),
+                    "cost_self_use_eur": result.get("cost_self_use_eur"),
+                    "estimated_savings_eur": result.get("estimated_savings_eur"),
                     "savings_are_estimated": True,
                     "energy_aid": settings["energy_aid"],
                     "pv_capacity_kwp": settings["pv_capacity_kwp"],
@@ -2838,21 +3011,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "winter_consumption_kwh": settings[
                         "winter_consumption_kwh"
                     ],
-                    "estimated_daily_consumption_kwh": result[
-                        "estimated_daily_consumption_kwh"
-                    ],
-                    "consumption_estimate_source": result[
+                    "consumption_estimate_source": result.get(
                         "consumption_estimate_source"
-                    ],
-                    "consumption_history_days": result[
+                    ),
+                    "consumption_history_days": result.get(
                         "consumption_history_days"
-                    ],
-                    "hourly_consumption_profile_source": result[
+                    ),
+                    "hourly_consumption_profile_source": result.get(
                         "hourly_consumption_profile_source"
-                    ],
-                    "hourly_consumption_profile_days": result[
+                    ),
+                    "hourly_consumption_profile_days": result.get(
                         "hourly_consumption_profile_days"
-                    ],
+                    ),
                 },
             )
             if warning:
