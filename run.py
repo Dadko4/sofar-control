@@ -598,10 +598,13 @@ def optimize_day(
     if local_now.minute or local_now.second or local_now.microsecond:
         current_hour_utc += timedelta(hours=1)
     
-    plan_date = local_now.date() + timedelta(days=1 if local_now.hour >= 22 else 0)
+    # Plan always covers from now until 06:00 next day (24 hour window)
+    # If it's 05:00, plan covers 05:00 today until 06:00 tomorrow
+    # If it's 22:00, plan covers 22:00 today until 06:00 tomorrow
+    plan_date = local_now.date()
     horizon_end = datetime.combine(
         plan_date + timedelta(days=1),
-        datetime_time(0),
+        datetime_time(6, 0),  # Always end at 06:00 (night tariff boundary)
         tzinfo=ZoneInfo(TIMEZONE),
     )
     horizon_end_utc = horizon_end.astimezone(timezone.utc)
@@ -641,10 +644,13 @@ def optimize_day(
     if len(forecast_hours) < expected_hours:
         raise ForecastError("Solar forecast does not cover the next charging cycle.")
     
+    # Collect hours for the planning window: from now until 06:00 tomorrow
+    # This includes hours from current date AND next date (until 06:00)
     plan_date_hours = [
         hour.astimezone(ZoneInfo(TIMEZONE)).hour
         for hour in sorted(forecast_hours)
-        if hour.astimezone(ZoneInfo(TIMEZONE)).date() == plan_date
+        if (hour.astimezone(ZoneInfo(TIMEZONE)).date() == plan_date or
+            hour.astimezone(ZoneInfo(TIMEZONE)).date() == plan_date + timedelta(days=1))
     ]
     
     profile_total = sum(
