@@ -661,15 +661,18 @@
         return;
       }
       
-      // For now, apply the first window (future: multi-window scheduler)
-      const window = windows[0];
-      const startDate = window.charge_start.slice(0, 10);
-      const endDate = window.charge_end.slice(0, 10);
-      const startTime = window.charge_start.slice(11, 16);
-      const endTime = window.charge_end.slice(11, 16);
+      // Display all windows in confirmation
+      const startTime = windows[0].charge_start.slice(11, 16);
+      const endTime = windows[windows.length - 1].charge_end.slice(11, 16);
       const windowCount = windows.length;
-      const message = `Uložiť plán: appka zapne nabíjanie v prvom okne ${startTime}–${endTime} (${startDate} až ${endDate}) do ${window.recommended_target_soc} % SOC a po skončení prepne menič na Self-use. Celkom je ${windowCount} okien na dnes; zvyšné budú naplánované v budúcej verzii. Appka/server musia počas plánu bežať.`;
-      if (!window.confirm(`${message}\n\nPotvrdením povolíš appke odoslať oba príkazy do meniča v naplánovanom čase.`)) return;
+      let windowSummary = windows.map((w, i) => {
+        const st = w.charge_start.slice(11, 16);
+        const et = w.charge_end.slice(11, 16);
+        return `${i + 1}. ${st}–${et} (${w.recommended_target_soc}%)`;
+      }).join("\n");
+      
+      const message = `Uložiť plán: appka zapne nabíjanie v ${windowCount} oknách dnes:\n\n${windowSummary}\n\nPo každom okne prepne menič na Self-use. Appka/server musia počas plánu bežať.`;
+      if (!window.confirm(`${message}\n\nPotvrdením povolíš appke odoslať príkazy do meniča v naplánovaných časoch.`)) return;
       
       const button = document.getElementById("apply-optimization");
       button.disabled = true;
@@ -678,22 +681,15 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            plan: {
-              generated_at: optimizationPlan.generated_at,
-              charge_start: window.charge_start,
-              charge_end: window.charge_end,
-              recommended: true,
-              recommended_target_soc: window.recommended_target_soc,
-              recommended_grid_charge_kwh: window.recommended_grid_charge_kwh,
-              estimated_savings_eur: optimizationPlan.estimated_savings_eur,
-              plan_date: optimizationPlan.plan_date
-            },
+            windows: windows,
+            plan_date: optimizationPlan.plan_date,
+            generated_at: optimizationPlan.generated_at,
             confirmed: true
           })
         });
         const result = await response.json();
         if (!response.ok) throw new Error(`${result.error || `Chyba HTTP ${response.status}`}${result.stage ? ` (${result.stage})` : ""}`);
-        document.getElementById("status").textContent = `Plán je uložený. Appka prepne menič do nabíjania v určenom čase a po okne vráti Self-use.${result.history_warning ? ` ${result.history_warning}` : ""}`;
+        document.getElementById("status").textContent = `Plán ${windowCount} okien je uložený. Appka prepne menič do nabíjania v určených časoch a vráti Self-use.${result.history_warning ? ` ${result.history_warning}` : ""}`;
         button.hidden = true;
         await refreshScheduledPlan();
         await refreshHistory();

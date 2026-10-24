@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import socketio
 
 from history import HistoryStore
+from multi_window_scheduler import MultiWindowScheduler
 from planner import BatteryModel, optimize_windows
 
 
@@ -2735,6 +2736,14 @@ SCHEDULED_CHARGE = ScheduledChargeController(
     MODE_CONTROL_LOCK,
     lambda: DISCHARGE_WATCHDOG.get_state()["active"],
 )
+MULTI_WINDOW_SCHEDULER = MultiWindowScheduler(
+    CLIENT,
+    Path(tempfile.gettempdir()) / "multi_window_state.json",
+    MODE_CONTROL_LOCK,
+    lambda: DISCHARGE_WATCHDOG.get_state()["active"],
+    TIMEZONE,
+    LOGGER,
+)
 TELEMETRY_SAMPLER = None
 
 
@@ -2814,8 +2823,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(409, {"error": "A discharge plan is active; scheduled charging cannot be started."})
                 return
             try:
-                result = SCHEDULED_CHARGE.schedule(payload.get("plan"))
-                self._send_json(202, result)
+                # Support both single plan and multi-window scheduling
+                if "windows" in payload and isinstance(payload["windows"], list):
+                    # Multi-window scheduling
+                    windows = payload["windows"]
+                    plan_date = payload.get("plan_date", "")
+                    result = MULTI_WINDOW_SCHEDULER.schedule_windows(windows, plan_date)
+                    self._send_json(202, result)
+                else:
+                    # Legacy single-window scheduling
+                    result = SCHEDULED_CHARGE.schedule(payload.get("plan"))
+                    self._send_json(202, result)
             except ValueError as error:
                 self._send_json(400, {"error": str(error), "stage": "validation"})
             except RuntimeError as error:
@@ -3108,6 +3126,7 @@ def main():
     TELEMETRY_SAMPLER = TelemetrySampler(CLIENT, HISTORY_STORE)
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), DashboardHandler)
     SCHEDULED_CHARGE.start()
+    MULTI_WINDOW_SCHEDULER.start()
     TELEMETRY_SAMPLER.start()
     LOGGER.info("Dashboard available at http://%s:%s", WEB_HOST, WEB_PORT)
     try:
@@ -3116,6 +3135,7 @@ def main():
         LOGGER.info("Shutting down dashboard.")
     finally:
         SCHEDULED_CHARGE.stop()
+        MULTI_WINDOW_SCHEDULER.stop()
         TELEMETRY_SAMPLER.stop()
         server.server_close()
 
