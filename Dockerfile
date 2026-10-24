@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY run.py .
 COPY history.py .
+COPY planner.py .
+COPY multi_window_scheduler.py .
+COPY live_metrics.py .
 COPY web ./web
 
 USER app
