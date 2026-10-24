@@ -2773,6 +2773,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as error:
                 LOGGER.exception("Could not calculate live metrics: %s", error)
                 self._send_json(500, {"error": "Could not calculate live metrics."})
+        elif self.path == "/api/daily-results":
+            if HISTORY_STORE is None:
+                self._send_json(503, {"error": "History logging is not initialized."})
+            else:
+                try:
+                    results = HISTORY_STORE.get_daily_results()
+                    self._send_json(200, {"daily_results": results})
+                except sqlite3.Error as error:
+                    LOGGER.exception("Could not read daily results: %s", error)
+                    self._send_json(503, {"error": "Could not read daily results."})
         elif self.path == "/api/history":
             if HISTORY_STORE is None:
                 self._send_json(503, {"error": "History logging is not initialized."})

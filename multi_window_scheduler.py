@@ -5,6 +5,7 @@ Manages multiple charging windows per day with automatic sequencing:
 - Starts first window when time comes
 - Transitions to self-use after each window
 - Retry logic (5x with 2min intervals) on mode change failures
+- Records daily results to history store
 """
 
 import json
@@ -186,6 +187,10 @@ class MultiWindowScheduler:
                         self._state["status"] = "pending"
                     else:
                         self._state["status"] = "completed"
+                        self._save_state()
+                        # Record daily results
+                        self._record_daily_result()
+                        return
                     self._save_state()
                 return
             except Exception as e:
@@ -226,3 +231,82 @@ class MultiWindowScheduler:
             except Exception as e:
                 LOGGER.exception(f"Multi-window scheduler error: {e}")
             self._stop_event.wait(1)
+    
+    def _record_daily_result(self):
+        """Record daily plan results to history store."""
+        if self.history_store is None:
+            LOGGER.warning("Cannot record daily result: history store not initialized")
+            return
+        
+        try:
+            with self._lock:
+                state = dict(self._state)
+            
+            plan_date = state.get("plan_date")
+            windows = state.get("windows_queue", [])
+            if not plan_date or not windows:
+                return
+            
+            # Get telemetry since first window start
+            plan_start = datetime.fromisoformat(windows[0]["charge_start"])
+            if plan_start.tzinfo is None:
+                plan_start = plan_start.replace(tzinfo=ZoneInfo(self.timezone_str))
+            
+            plan_end = datetime.fromisoformat(windows[-1]["charge_end"])
+            if plan_end.tzinfo is None:
+                plan_end = plan_end.replace(tzinfo=ZoneInfo(self.timezone_str))
+            
+            # Query telemetry
+            import sqlite3
+            from contextlib import closing
+            
+            with closing(self.history_store._connect()) as conn:
+                # Get total costs and grid import
+                row = conn.execute(
+                    """
+                    SELECT 
+                        SUM(observed_grid_import_delta_kwh) as total_grid_kwh,
+                        SUM(observed_grid_import_cost_with_aid_eur) as cost_with_aid,
+                        SUM(observed_grid_import_cost_without_aid_eur) as cost_without_aid
+                    FROM telemetry
+                    WHERE sampled_at >= ? AND sampled_at <= ?
+                    """,
+                    (plan_start.isoformat(), plan_end.isoformat())
+                ).fetchone()
+                
+                grid_import_kwh = row[0] or 0.0
+                cost_with_aid = row[1] or 0.0
+                cost_without_aid = row[2] or 0.0
+                
+                # Get daily totals at end of day
+                row = conn.execute(
+                    """
+                    SELECT 
+                        daily_generation_kwh, daily_consumption_kwh, daily_battery_discharge_kwh
+                    FROM telemetry
+                    WHERE substr(sampled_at, 1, 10) = ?
+                    ORDER BY sampled_at DESC
+                    LIMIT 1
+                    """,
+                    (plan_date,)
+                ).fetchone()
+                
+                generation_kwh = (row[0] if row else None) or 0.0
+                consumption_kwh = (row[1] if row else None) or 0.0
+                battery_discharge_kwh = (row[2] if row else None) or 0.0
+            
+            # Record result
+            self.history_store.record_daily_result(
+                plan_date,
+                len(windows),
+                state.get("status", "unknown"),
+                grid_import_kwh,
+                cost_with_aid,
+                cost_without_aid,
+                generation_kwh,
+                consumption_kwh,
+                battery_discharge_kwh,
+            )
+            LOGGER.info(f"Recorded daily result for {plan_date}: {len(windows)} windows, €{cost_with_aid:.2f} cost")
+        except Exception as e:
+            LOGGER.exception(f"Could not record daily result: {e}")

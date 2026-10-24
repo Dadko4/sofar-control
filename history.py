@@ -50,6 +50,18 @@ class HistoryStore:
                     source TEXT PRIMARY KEY,
                     synced_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS daily_results (
+                    plan_date TEXT PRIMARY KEY,
+                    windows_count INTEGER,
+                    plan_status TEXT,
+                    actual_cost_with_aid_eur REAL,
+                    actual_cost_without_aid_eur REAL,
+                    actual_grid_import_kwh REAL,
+                    actual_generation_kwh REAL,
+                    actual_consumption_kwh REAL,
+                    actual_battery_discharge_kwh REAL,
+                    completed_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -356,3 +368,47 @@ class HistoryStore:
             ],
             "telemetry": [dict(row) for row in telemetry],
         }
+
+    def record_daily_result(self, plan_date, windows_count, plan_status, grid_import_kwh, cost_with_aid, cost_without_aid, generation_kwh, consumption_kwh, battery_discharge_kwh):
+        """Record daily plan results after plan completion."""
+        with closing(self._connect()) as connection:
+            connection.execute(
+                    """
+                    INSERT OR REPLACE INTO daily_results
+                    (plan_date, windows_count, plan_status, actual_cost_with_aid_eur, 
+                     actual_cost_without_aid_eur, actual_grid_import_kwh, actual_generation_kwh,
+                     actual_consumption_kwh, actual_battery_discharge_kwh, completed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        plan_date,
+                        windows_count,
+                        plan_status,
+                        self._number(cost_with_aid),
+                        self._number(cost_without_aid),
+                        self._number(grid_import_kwh),
+                        self._number(generation_kwh),
+                        self._number(consumption_kwh),
+                        self._number(battery_discharge_kwh),
+                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    ),
+            )
+            connection.commit()
+
+    def get_daily_results(self, limit=30):
+        """Get recent daily plan results."""
+        limit = max(1, min(200, int(limit)))
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                    """
+                    SELECT plan_date, windows_count, plan_status, 
+                           actual_cost_with_aid_eur, actual_cost_without_aid_eur,
+                           actual_grid_import_kwh, actual_generation_kwh,
+                           actual_consumption_kwh, actual_battery_discharge_kwh, completed_at
+                    FROM daily_results
+                    ORDER BY plan_date DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
