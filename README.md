@@ -131,6 +131,42 @@ Rozdiel sa porovnáva len na intervaloch s použiteľnou telemetriou a je preto
 modelovaný odhad, nie priamo nameraná ani garantovaná úspora. Výsledky plánov
 načítava API `/api/optimization-results`;
 udalosti a posledné telemetrické vzorky zostávajú dostupné cez `/api/history`.
+
+### Nepretržitá optimalizácia
+
+V sekcii plánovania možno zapnúť automatické prepočítavanie. Automatika používa
+24-hodinový posuvný horizont a prepočet spúšťa približne každú hodinu o :55,
+aby nový plán mohol začať od najbližšej celej hodiny. Ak už práve prebieha
+nabíjacie okno, prepočet ho neprepíše a počká na ďalší hodinový cyklus.
+Plánovač môže pri novom výpočte nahradiť čakajúci alebo vyhodnocovaný starší
+automatický plán. Server a spojenie so SofarCloud musia byť dostupné; stav
+zapnutia, nastavenia a priebežná história sa ukladajú do SQLite databázy.
+Reštart servera preto automatiku obnoví.
+
+Vypnutie automatiky zruší jej plán a pokúsi sa vrátiť menič do Self-use.
+Ručná zmena režimu na Self-use automatiku tiež vypne; iné ručné režimy a
+plánovanie na požiadanie sú počas jej aktivity blokované, aby si automatika
+navzájom neprepisovala povely. Plánovací horizont je v automatike pevne 24
+hodín; samostatné nastavenie 12/24/36 hodín sa naďalej používa pre plán na
+požiadanie.
+
+Prehľad výsledkov umožňuje zvoliť obdobie 1 až 30 dní. Zobrazuje náklad v
+aktívnych intervaloch, simulovaný Self-use a ich rozdiel. Self-use sa
+simuluje podľa nameranej výroby a spotreby a počiatočného SOC na začiatku
+každého súvislého zapnutého obdobia; úspora je preto odhad, nie priamo
+nameraná hodnota. Pokrytie telemetriou a počet aktívnych hodín sa zobrazujú
+ako kontext výsledku. API: `/api/continuous-optimization` a
+`/api/continuous-results?days=7`.
+
+Dashboard priebežne zobrazuje tri SVG grafy bez externej grafovej knižnice:
+24-hodinový priebeh výkonových tokov, dennú a kumulatívnu odhadovanú úsporu
+nepretržitej optimalizácie a porovnanie predpovede so skutočnosťou pri
+vyhodnotených plánoch. Údaje výkonového grafu poskytuje
+`/api/telemetry?hours=24`; merania sa obnovujú každých päť minút. Znamienko
+výkonu siete je ponechané podľa telemetrie meniča a pri výpadkoch sa v grafe
+nevykresľuje spojitá odhadovaná čiara. Podrobné hodinové tabuľky plánov sú
+zbalené pod rozklikávacím detailom.
+
 Dashboard zobrazuje nabíjanie a vybíjanie zvlášť z polí SofarCloud
 `chargePower` a `disChargePower`; vybíjací výkon sa ukazuje ako kladná veľkosť,
 aj keď API posiela zápornú hodnotu. Zobrazuje tiež kapacitu batérie,

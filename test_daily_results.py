@@ -129,9 +129,44 @@ def test_telemetry_query_includes_boundary_samples():
     assert len(rows) == 3
 
 
+def test_telemetry_chart_period_returns_power_flow_samples():
+    db_path = Path(tempfile.gettempdir()) / "test_telemetry_chart.db"
+    db_path.unlink(missing_ok=True)
+    store = HistoryStore(db_path)
+    start = datetime(2026, 10, 26, 10, tzinfo=ZoneInfo("UTC"))
+    for sample_index in range(3):
+        sampled_at = start + timedelta(minutes=5 * sample_index)
+        store.record_telemetry(
+            {
+                "metrics": {
+                    "generation_power": sample_index + 1,
+                    "use_power": 2,
+                    "battery_soc": 50,
+                    "charge_power": 0.5,
+                    "discharge_power": 0,
+                    "grid_power": -0.5,
+                }
+            },
+            sampled_at,
+            0.1,
+            0.12,
+        )
+
+    samples = store.telemetry_chart_period(
+        start.isoformat(),
+        (start + timedelta(minutes=10)).isoformat(),
+    )
+
+    assert len(samples) == 3
+    assert samples[2]["generation_kw"] == 3
+    assert samples[2]["battery_charge_kw"] == 0.5
+    assert samples[2]["grid_kw"] == -0.5
+
+
 if __name__ == "__main__":
     test_record_and_retrieve_daily_result()
     test_multiple_daily_results()
     test_optimization_plan_forecast_and_actual_are_persisted()
     test_telemetry_query_includes_boundary_samples()
+    test_telemetry_chart_period_returns_power_flow_samples()
     print("\n✓ All daily results tests passed!")

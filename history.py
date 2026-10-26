@@ -73,6 +73,25 @@ class HistoryStore:
                     created_at TEXT NOT NULL,
                     completed_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS continuous_optimization_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    enabled INTEGER NOT NULL,
+                    settings_json TEXT NOT NULL,
+                    battery_model_json TEXT,
+                    last_run_at TEXT,
+                    next_run_at TEXT,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS continuous_optimization_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    settings_json TEXT NOT NULL
+                );
+                INSERT OR IGNORE INTO continuous_optimization_state
+                    (id, enabled, settings_json, updated_at)
+                VALUES (1, 0, '{}', CURRENT_TIMESTAMP);
                 """
             )
 
@@ -535,6 +554,8 @@ class HistoryStore:
             rows = connection.execute(
                 """
                 SELECT sampled_at, generation_kw, consumption_kw, battery_soc,
+                       battery_charge_kw, battery_discharge_kw, grid_kw,
+                       battery_capacity_kwh,
                        observed_grid_import_delta_kwh,
                        observed_grid_import_cost_with_aid_eur,
                        observed_grid_import_cost_without_aid_eur
@@ -546,3 +567,181 @@ class HistoryStore:
                 (start_at.isoformat(), end_at.isoformat()),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def telemetry_chart_period(self, start, end):
+        start_at = datetime.fromisoformat(start)
+        end_at = datetime.fromisoformat(end)
+        if start_at.tzinfo is None or end_at.tzinfo is None or end_at <= start_at:
+            raise ValueError("Telemetry chart range must be timezone-aware and increasing.")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT sampled_at, data_time, generation_kw, consumption_kw,
+                       battery_soc, battery_charge_kw, battery_discharge_kw, grid_kw
+                FROM telemetry
+                WHERE julianday(sampled_at) >= julianday(?)
+                  AND julianday(sampled_at) <= julianday(?)
+                ORDER BY julianday(sampled_at), id
+                """,
+                (start_at.isoformat(), end_at.isoformat()),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_continuous_optimization_state(self):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT enabled, settings_json, battery_model_json, last_run_at,
+                       next_run_at, last_error
+                FROM continuous_optimization_state
+                WHERE id = 1
+                """
+            ).fetchone()
+        return {
+            "enabled": bool(row["enabled"]),
+            "settings": json.loads(row["settings_json"]),
+            "battery_model": json.loads(row["battery_model_json"])
+            if row["battery_model_json"]
+            else None,
+            "last_run_at": row["last_run_at"],
+            "next_run_at": row["next_run_at"],
+            "last_error": row["last_error"],
+        }
+
+    def save_continuous_optimization_state(self, state, changed_at=None):
+        if not isinstance(state, dict) or not isinstance(state.get("enabled"), bool):
+            raise ValueError("Continuous optimization state must include an enabled flag.")
+        settings = state.get("settings")
+        if not isinstance(settings, dict):
+            raise ValueError("Continuous optimization settings must be an object.")
+        battery_model = state.get("battery_model")
+        if battery_model is not None and not isinstance(battery_model, dict):
+            raise ValueError("Continuous optimization battery model must be an object.")
+        timestamp = (changed_at or datetime.now(timezone.utc)).isoformat(
+            timespec="seconds"
+        )
+        settings_json = json.dumps(
+            settings,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        battery_model_json = (
+            json.dumps(
+                battery_model,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            if battery_model is not None
+            else None
+        )
+        with closing(self._connect()) as connection, connection:
+            previous = connection.execute(
+                "SELECT enabled FROM continuous_optimization_state WHERE id = 1"
+            ).fetchone()
+            was_enabled = bool(previous["enabled"]) if previous else False
+            if state["enabled"] and not was_enabled:
+                connection.execute(
+                    """
+                    INSERT INTO continuous_optimization_sessions
+                        (started_at, settings_json)
+                    VALUES (?, ?)
+                    """,
+                    (timestamp, settings_json),
+                )
+            elif not state["enabled"] and was_enabled:
+                connection.execute(
+                    """
+                    UPDATE continuous_optimization_sessions
+                    SET ended_at = ?
+                    WHERE ended_at IS NULL
+                    """,
+                    (timestamp,),
+                )
+            connection.execute(
+                """
+                INSERT INTO continuous_optimization_state (
+                    id, enabled, settings_json, battery_model_json, last_run_at,
+                    next_run_at, last_error, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    settings_json = excluded.settings_json,
+                    battery_model_json = excluded.battery_model_json,
+                    last_run_at = excluded.last_run_at,
+                    next_run_at = excluded.next_run_at,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(state["enabled"]),
+                    settings_json,
+                    battery_model_json,
+                    state.get("last_run_at"),
+                    state.get("next_run_at"),
+                    state.get("last_error"),
+                    timestamp,
+                ),
+            )
+
+    def get_continuous_optimization_sessions(self, start, end):
+        start_at = datetime.fromisoformat(start)
+        end_at = datetime.fromisoformat(end)
+        if start_at.tzinfo is None or end_at.tzinfo is None or end_at <= start_at:
+            raise ValueError("Continuous optimization range must be timezone-aware and increasing.")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT started_at, ended_at, settings_json
+                FROM continuous_optimization_sessions
+                WHERE julianday(started_at) < julianday(?)
+                  AND (ended_at IS NULL OR julianday(ended_at) > julianday(?))
+                ORDER BY julianday(started_at)
+                """,
+                (end_at.isoformat(), start_at.isoformat()),
+            ).fetchall()
+        return [
+            {
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+                "settings": json.loads(row["settings_json"]),
+            }
+            for row in rows
+        ]
+
+    def update_continuous_optimization_runtime(
+        self,
+        *,
+        last_run_at,
+        next_run_at,
+        last_error,
+        battery_model=None,
+    ):
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT battery_model_json FROM continuous_optimization_state WHERE id = 1"
+            ).fetchone()
+            battery_model_json = row["battery_model_json"] if row else None
+            if battery_model is not None:
+                battery_model_json = json.dumps(
+                    battery_model,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            connection.execute(
+                """
+                UPDATE continuous_optimization_state
+                SET last_run_at = ?, next_run_at = ?, last_error = ?,
+                    battery_model_json = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (
+                    last_run_at,
+                    next_run_at,
+                    last_error,
+                    battery_model_json,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )

@@ -48,6 +48,15 @@
     .table-wrap { margin-top: 12px; max-width: 100%; overflow-x: auto; }
     .plan-result { margin-top: 12px; padding: 12px; border: 1px solid #283d4d; border-radius: 10px; }
     .plan-result > summary { cursor: pointer; color: #c5d4de; font-weight: 650; }
+    .chart-panel { min-width: 0; padding: 12px; border: 1px solid #283d4d; border-radius: 10px; background: #14212c; }
+    .chart-panel h3 { margin: 0 0 10px; color: #c5d4de; font-size: 1rem; }
+    .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 12px; margin-top: 12px; }
+    .chart-svg { display: block; width: 100%; height: 250px; overflow: visible; }
+    .chart-svg text { fill: #9eafbd; font: 11px Inter, "Segoe UI", sans-serif; }
+    .chart-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; color: #b7c6d1; font-size: .82rem; }
+    .chart-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .chart-legend-swatch { width: 18px; height: 3px; border-radius: 2px; }
+    .chart-note { margin: 8px 0 0; color: #9eafbd; font-size: .82rem; }
     table { width: 100%; border-collapse: collapse; font-size: .88rem; white-space: nowrap; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #283d4d; text-align: right; }
     th:first-child, td:first-child { text-align: left; }
@@ -91,6 +100,12 @@
       <article class="card"><div class="label">Energia do batérie</div><div class="value" id="daily-battery-charge">—</div></article>
       <article class="card"><div class="label">Energia z batérie</div><div class="value" id="daily-battery-discharge">—</div></article>
     </section>
+    <section class="controls" aria-labelledby="power-flow-title">
+      <h2 id="power-flow-title">Výkonové toky za posledných 24 hodín</h2>
+      <p class="hint">Výkon FVE, spotreby domu, batérie a siete z telemetrie v približne päťminútových intervaloch.</p>
+      <p id="power-flow-status" class="hint" role="status" aria-live="polite">Načítavam priebeh…</p>
+      <div id="power-flow-chart" class="chart-panel" hidden></div>
+    </section>
     <section class="controls" aria-labelledby="optimization-title">
       <h2 id="optimization-title">Plán podľa počasia a tarify 4T</h2>
       <p class="hint">Plán začína od najbližšej celej hodiny a pokrýva zvolený priebežný horizont. Po potvrdení appka v odporúčanom čase zapne nabíjanie a po každom okne vráti menič do Self-use; server musí byť počas plánu dostupný.</p>
@@ -123,6 +138,24 @@
       <button id="apply-optimization" type="button" disabled hidden>Naplánovať odporúčané nabíjanie</button>
       <div id="hourly-plan" class="table-wrap" hidden></div>
       <p id="scheduled-plan-status" class="hint" role="status" aria-live="polite">Načítavam uložený plán…</p>
+      <h3 class="section-title">Nepretržitá optimalizácia</h3>
+      <p class="hint">Automatika používa posuvný 24-hodinový horizont a nový plán prepočítava každú hodinu približne o :55. Menič neprepína počas prebiehajúceho nabíjacieho okna. Server a spojenie so SofarCloud musia zostať dostupné.</p>
+      <div class="control-row">
+        <button id="continuous-toggle" type="button" disabled>Načítavam stav…</button>
+        <span id="continuous-status" class="hint" role="status" aria-live="polite">Načítavam stav automatiky…</span>
+      </div>
+      <div class="control-row">
+        <label for="continuous-days">Výsledky za posledných</label>
+        <input id="continuous-days" type="number" min="1" max="30" step="1" value="7">
+        <span class="label">dní</span>
+      </div>
+      <section class="cards" aria-label="Výsledky nepretržitej optimalizácie">
+        <article class="card"><div class="label">Odhadovaná úspora</div><div class="value" id="continuous-savings">—</div></article>
+        <article class="card"><div class="label">Náklad v aktívnych intervaloch</div><div class="value" id="continuous-actual-cost">—</div></article>
+        <article class="card"><div class="label">Modelovaný Self-use</div><div class="value" id="continuous-self-use-cost">—</div></article>
+      </section>
+      <p id="continuous-results-status" class="hint" role="status" aria-live="polite">Načítavam výsledky…</p>
+      <div id="continuous-savings-chart" class="chart-panel" hidden></div>
       <p id="live-metrics" class="hint" role="status" aria-live="polite"></p>
       <p class="hint">4T: noc 22:00–06:00, predpoludnie 09:00–13:00, popoludnie 13:00–19:00, ranná/večerná špička 06:00–09:00 a 19:00–22:00. Cez víkend sa ceny znižujú o 12 %. Fixný poplatok 1,50 € mesačne sa nemení podľa nabíjania a vo výpočte nie je zahrnutý.</p>
       <p class="hint">Predpoveď počasia: <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open-Meteo</a>.</p>
@@ -416,6 +449,384 @@
       return `${Number(value).toLocaleString("sk-SK", { maximumFractionDigits: 2 })}${unit ? ` ${unit}` : ""}`;
     }
 
+    const SVG_NS = "http://www.w3.org/2000/svg";
+
+    function svgElement(name, attributes = {}) {
+      const element = document.createElementNS(SVG_NS, name);
+      for (const [key, value] of Object.entries(attributes)) {
+        element.setAttribute(key, value);
+      }
+      return element;
+    }
+
+    function renderLineChart(container, datasets, title, unit, options = {}) {
+      container.replaceChildren();
+      const usable = datasets
+        .map(dataset => ({
+          ...dataset,
+          points: (dataset.points || []).filter(point =>
+            Number.isFinite(Date.parse(point.time))
+          )
+        }))
+        .filter(dataset => dataset.points.some(point => Number.isFinite(point.value)));
+      if (usable.length === 0) {
+        container.textContent = "Zatiaľ nie sú dostupné merania na zobrazenie.";
+        return;
+      }
+
+      const width = 800;
+      const height = 270;
+      const margin = { top: 18, right: 18, bottom: 38, left: 62 };
+      const plotWidth = width - margin.left - margin.right;
+      const plotHeight = height - margin.top - margin.bottom;
+      const allPoints = usable.flatMap(dataset =>
+        dataset.points.filter(point => Number.isFinite(point.value))
+      );
+      const times = allPoints.map(point => Date.parse(point.time));
+      const xMin = Math.min(...times);
+      const xMax = Math.max(...times);
+      const xSpan = Math.max(1, xMax - xMin);
+      const values = allPoints.map(point => point.value);
+      const yMin = options.yMin ?? Math.min(0, ...values);
+      const yMax = options.yMax ?? Math.max(0, ...values);
+      const yPadding = yMax === yMin ? Math.max(1, Math.abs(yMax) * .1) : (yMax - yMin) * .08;
+      const low = options.yMin ?? yMin - yPadding;
+      const high = options.yMax ?? yMax + yPadding;
+      const ySpan = Math.max(1e-9, high - low);
+      const x = time => margin.left + (Date.parse(time) - xMin) / xSpan * plotWidth;
+      const y = value => margin.top + (high - value) / ySpan * plotHeight;
+      const svg = svgElement("svg", {
+        class: "chart-svg",
+        viewBox: `0 0 ${width} ${height}`,
+        role: "img",
+        "aria-label": `${title}, jednotka ${unit}`
+      });
+      const svgTitle = svgElement("title");
+      svgTitle.textContent = `${title} (${unit})`;
+      svg.append(svgTitle);
+
+      for (let tick = 0; tick <= 4; tick++) {
+        const value = high - tick / 4 * ySpan;
+        const position = y(value);
+        svg.append(svgElement("line", {
+          x1: margin.left, x2: width - margin.right,
+          y1: position, y2: position, stroke: "#283d4d", "stroke-width": 1
+        }));
+        const label = svgElement("text", {
+          x: margin.left - 8, y: position + 4, "text-anchor": "end"
+        });
+        label.textContent = `${value.toLocaleString("sk-SK", { maximumFractionDigits: 1 })} ${unit}`;
+        svg.append(label);
+      }
+
+      const labelCount = Math.min(5, Math.max(2, allPoints.length));
+      for (let index = 0; index < labelCount; index++) {
+        const time = new Date(xMin + index / (labelCount - 1) * xSpan);
+        const label = svgElement("text", {
+          x: margin.left + index / (labelCount - 1) * plotWidth,
+          y: height - 10,
+          "text-anchor": index === 0 ? "start" : index === labelCount - 1 ? "end" : "middle"
+        });
+        label.textContent = options.timeLabel
+          ? options.timeLabel(time)
+          : time.toLocaleTimeString("sk-SK", { hour: "2-digit", minute: "2-digit" });
+        svg.append(label);
+      }
+
+      for (const dataset of usable) {
+        let path = "";
+        let drawing = false;
+        for (const point of dataset.points) {
+          if (!Number.isFinite(point.value)) {
+            drawing = false;
+            continue;
+          }
+          const command = `${drawing ? "L" : "M"}${x(point.time).toFixed(1)},${y(point.value).toFixed(1)}`;
+          path += `${command} `;
+          drawing = true;
+        }
+        const line = svgElement("path", {
+          d: path.trim(),
+          fill: "none",
+          stroke: dataset.color,
+          "stroke-width": 2.5,
+          "stroke-linejoin": "round",
+          "stroke-linecap": "round"
+        });
+        if (dataset.dash) line.setAttribute("stroke-dasharray", dataset.dash);
+        const lineTitle = svgElement("title");
+        lineTitle.textContent = dataset.name;
+        line.append(lineTitle);
+        svg.append(line);
+      }
+      container.append(svg);
+
+      const legend = document.createElement("div");
+      legend.className = "chart-legend";
+      for (const dataset of usable) {
+        const item = document.createElement("span");
+        item.className = "chart-legend-item";
+        const swatch = document.createElement("span");
+        swatch.className = "chart-legend-swatch";
+        swatch.style.backgroundColor = dataset.color;
+        if (dataset.dash) {
+          swatch.style.backgroundColor = "transparent";
+          swatch.style.borderTop = `2px dashed ${dataset.color}`;
+        }
+        item.append(swatch, document.createTextNode(dataset.name));
+        legend.append(item);
+      }
+      container.append(legend);
+    }
+
+    function renderPowerFlowChart(samples) {
+      const chart = document.getElementById("power-flow-chart");
+      chart.hidden = false;
+      const series = [
+        ["generation_kw", "Výroba FVE", "#f6c85f"],
+        ["consumption_kw", "Spotreba domu", "#ed6a5a"],
+        ["grid_kw", "Sieť (znamienko meniča)", "#5dade2"],
+        ["battery_charge_kw", "Nabíjanie batérie", "#55c596"],
+        ["battery_discharge_kw", "Vybíjanie batérie (−)", "#b28dff"]
+      ];
+      const datasets = series.map(([field, name, color]) => ({
+        name,
+        color,
+        points: samples.map(sample => ({
+          time: sample.sampled_at,
+          value: field === "battery_discharge_kw" && Number.isFinite(sample[field])
+            ? -Math.abs(sample[field])
+            : sample[field]
+        }))
+      }));
+      renderLineChart(chart, datasets, "Výkonové toky za posledných 24 hodín", "kW");
+      const note = document.createElement("p");
+      note.className = "chart-note";
+      note.textContent = "Odber/výroba siete sa zobrazuje so znamienkom, ktoré poskytuje menič; merania chýbajúce pri výpadku telemetrie sa nepripájajú odhadovanou čiarou.";
+      chart.append(note);
+    }
+
+    function renderSavingsChart(daily) {
+      const container = document.getElementById("continuous-savings-chart");
+      container.replaceChildren();
+      container.hidden = false;
+      const days = daily.filter(day => day && day.date);
+      if (days.length === 0 || !days.some(day => Number.isFinite(day.savings_eur))) {
+        container.textContent = "Po nazbieraní telemetrie sa tu zobrazí denný odhad úspory.";
+        return;
+      }
+
+      const width = 800;
+      const height = 300;
+      const margin = { top: 22, right: 62, bottom: 42, left: 62 };
+      const plotWidth = width - margin.left - margin.right;
+      const plotHeight = height - margin.top - margin.bottom;
+      const dailyValues = days.map(day => day.savings_eur).filter(Number.isFinite);
+      const cumulativeValues = days.map(day => day.cumulative_savings_eur).filter(Number.isFinite);
+      const dailyExtent = Math.max(.01, ...dailyValues.map(Math.abs)) * 1.15;
+      const cumulativeMin = Math.min(0, ...cumulativeValues);
+      const cumulativeMax = Math.max(.01, ...cumulativeValues);
+      const cumulativeSpan = Math.max(.01, cumulativeMax - cumulativeMin);
+      const x = index => margin.left + (index + .5) / days.length * plotWidth;
+      const yDaily = value => margin.top + (dailyExtent - value) / (dailyExtent * 2) * plotHeight;
+      const yCumulative = value => margin.top + (cumulativeMax - value) / cumulativeSpan * plotHeight;
+      const zeroY = yDaily(0);
+      const svg = svgElement("svg", {
+        class: "chart-svg",
+        viewBox: `0 0 ${width} ${height}`,
+        role: "img",
+        "aria-label": "Denná a kumulatívna odhadovaná úspora"
+      });
+      const title = svgElement("title");
+      title.textContent = "Denná odhadovaná úspora a kumulatívny súčet";
+      svg.append(title);
+
+      for (let tick = 0; tick <= 4; tick++) {
+        const fraction = tick / 4;
+        const position = margin.top + fraction * plotHeight;
+        const dailyValue = dailyExtent - fraction * dailyExtent * 2;
+        const cumulativeValue = cumulativeMax - fraction * cumulativeSpan;
+        svg.append(svgElement("line", {
+          x1: margin.left, x2: width - margin.right,
+          y1: position, y2: position, stroke: "#283d4d", "stroke-width": 1
+        }));
+        const leftLabel = svgElement("text", {
+          x: margin.left - 8, y: position + 4, "text-anchor": "end"
+        });
+        leftLabel.textContent = dailyValue.toLocaleString("sk-SK", { maximumFractionDigits: 2 });
+        svg.append(leftLabel);
+        const rightLabel = svgElement("text", {
+          x: width - margin.right + 8, y: position + 4, "text-anchor": "start"
+        });
+        rightLabel.textContent = cumulativeValue.toLocaleString("sk-SK", { maximumFractionDigits: 2 });
+        svg.append(rightLabel);
+      }
+      svg.append(svgElement("line", {
+        x1: margin.left, x2: width - margin.right,
+        y1: zeroY, y2: zeroY, stroke: "#7890a2", "stroke-width": 1.5
+      }));
+
+      const cellWidth = plotWidth / days.length;
+      days.forEach((day, index) => {
+        const value = day.savings_eur;
+        if (!Number.isFinite(value)) return;
+        const barY = yDaily(Math.max(0, value));
+        const barBottom = yDaily(Math.min(0, value));
+        const bar = svgElement("rect", {
+          x: x(index) - cellWidth * .28,
+          y: Math.min(barY, barBottom),
+          width: Math.max(2, cellWidth * .56),
+          height: Math.max(1, Math.abs(barBottom - barY)),
+          rx: 2,
+          fill: value >= 0 ? "#55c596" : "#ed6a5a"
+        });
+        const tooltip = svgElement("title");
+        tooltip.textContent = `${day.date}: ${historyNumber(value, "€")} · pokrytie ${historyNumber(day.coverage_percent, "%")}`;
+        bar.append(tooltip);
+        svg.append(bar);
+      });
+
+      let path = "";
+      let hasSegment = false;
+      days.forEach((day, index) => {
+        if (!Number.isFinite(day.cumulative_savings_eur)) {
+          hasSegment = false;
+          return;
+        }
+        path += `${hasSegment ? "L" : "M"}${x(index).toFixed(1)},${yCumulative(day.cumulative_savings_eur).toFixed(1)} `;
+        hasSegment = true;
+        const point = svgElement("circle", {
+          cx: x(index), cy: yCumulative(day.cumulative_savings_eur), r: 3.5,
+          fill: "#b28dff"
+        });
+        const tooltip = svgElement("title");
+        tooltip.textContent = `${day.date}: kumulatívne ${historyNumber(day.cumulative_savings_eur, "€")}`;
+        point.append(tooltip);
+        svg.append(point);
+      });
+      if (path) {
+        svg.append(svgElement("path", {
+          d: path.trim(),
+          fill: "none",
+          stroke: "#b28dff",
+          "stroke-width": 2.5,
+          "stroke-linejoin": "round",
+          "stroke-linecap": "round"
+        }));
+      }
+
+      const labelStep = Math.max(1, Math.ceil(days.length / 7));
+      days.forEach((day, index) => {
+        if (index % labelStep !== 0 && index !== days.length - 1) return;
+        const label = svgElement("text", {
+          x: x(index), y: height - 12, "text-anchor": "middle"
+        });
+        label.textContent = new Date(`${day.date}T12:00:00`).toLocaleDateString(
+          "sk-SK", { day: "2-digit", month: "2-digit" }
+        );
+        svg.append(label);
+      });
+      container.append(svg);
+      const legend = document.createElement("div");
+      legend.className = "chart-legend";
+      for (const [name, color] of [
+        ["Denná úspora (ľavá os)", "#55c596"],
+        ["Kumulatívna úspora (pravá os)", "#b28dff"]
+      ]) {
+        const item = document.createElement("span");
+        item.className = "chart-legend-item";
+        const swatch = document.createElement("span");
+        swatch.className = "chart-legend-swatch";
+        swatch.style.backgroundColor = color;
+        item.append(swatch, document.createTextNode(name));
+        legend.append(item);
+      }
+      container.append(legend);
+    }
+
+    function renderPlanComparisonCharts(container, forecast, actual) {
+      const actualByTime = new Map((actual.hourly || []).map(hour => [hour.time, hour]));
+      const forecastHours = forecast.hourly_plan || [];
+      const specs = [
+        {
+          title: "Výroba FVE a spotreba (kWh)",
+          unit: "kWh",
+          forecastField: ["solar_kwh", "consumption_kwh"],
+          actualField: ["solar_kwh", "consumption_kwh"],
+          names: ["FVE", "Spotreba"],
+          colors: ["#f6c85f", "#ed6a5a"]
+        },
+        {
+          title: "Odber zo siete (kWh)",
+          unit: "kWh",
+          forecastField: ["grid_import_kwh"],
+          actualField: ["grid_import_kwh"],
+          names: ["Odber zo siete"],
+          colors: ["#5dade2"]
+        },
+        {
+          title: "Náklad za hodinu (€)",
+          unit: "€",
+          forecastField: ["cost_eur"],
+          actualField: ["simulation_cost_eur", "cost_eur"],
+          names: ["Náklad"],
+          colors: ["#55c596"]
+        },
+        {
+          title: "Stav batérie SOC (%)",
+          unit: "%",
+          forecastField: ["soc_end"],
+          actualField: ["soc_end"],
+          names: ["SOC"],
+          colors: ["#b28dff"],
+          yMin: 0,
+          yMax: 100
+        }
+      ];
+      const grid = document.createElement("div");
+      grid.className = "chart-grid";
+      for (const spec of specs) {
+        const panel = document.createElement("section");
+        panel.className = "chart-panel";
+        const heading = document.createElement("h3");
+        heading.textContent = spec.title;
+        const chart = document.createElement("div");
+        panel.append(heading, chart);
+        const datasets = [];
+        spec.names.forEach((name, index) => {
+          const actualField = spec.actualField[index];
+          const forecastField = spec.forecastField[index];
+          datasets.push({
+            name: `${name} · predikcia`,
+            color: spec.colors[index],
+            dash: "7 5",
+            points: forecastHours.map(hour => ({
+              time: hour.time,
+              value: hour[forecastField]
+            }))
+          });
+          datasets.push({
+            name: `${name} · skutočnosť`,
+            color: spec.colors[index],
+            points: forecastHours.map(hour => {
+              const measured = actualByTime.get(hour.time) || {};
+              let value = measured[actualField];
+              if (Array.isArray(actualField)) {
+                value = actualField.map(field => measured[field]).find(Number.isFinite);
+              }
+              return { time: hour.time, value };
+            })
+          });
+        });
+        renderLineChart(chart, datasets, spec.title, spec.unit, {
+          yMin: spec.yMin,
+          yMax: spec.yMax
+        });
+        grid.append(panel);
+      }
+      container.append(grid);
+    }
+
     function renderOptimizationResults(plans) {
       const container = document.getElementById("plan-results");
       container.replaceChildren();
@@ -486,7 +897,13 @@
             ["Čas", "FVE pred / skutočná kWh", "Spotreba pred / skutočná kWh", "Import pred / skutočný kWh", "Náklad pred / skutočný €", "SOC pred / skutočný"],
             rows
           );
-          details.append(tableContainer);
+          renderPlanComparisonCharts(details, forecast, actual);
+          const tableDetails = document.createElement("details");
+          tableDetails.className = "plan-result";
+          const tableSummary = document.createElement("summary");
+          tableSummary.textContent = "Zobraziť hodinovú tabuľku";
+          tableDetails.append(tableSummary, tableContainer);
+          details.append(tableDetails);
         } else {
           appendOptimizationLine(
             details,
@@ -748,6 +1165,128 @@
       }
     }
 
+    function setContinuousInputsDisabled(disabled) {
+      for (const id of [
+        "optimization-location", "optimization-pv", "optimization-summer",
+        "optimization-winter", "optimization-aid", "optimization-horizon",
+        "calculate-optimization", "apply-optimization"
+      ]) {
+        document.getElementById(id).disabled = disabled;
+      }
+    }
+
+    async function refreshPowerChart() {
+      const status = document.getElementById("power-flow-status");
+      try {
+        const response = await fetch("/api/telemetry?hours=24", { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `Chyba HTTP ${response.status}`);
+        const samples = data.samples || [];
+        renderPowerFlowChart(samples);
+        status.classList.remove("error");
+        status.textContent = samples.length
+          ? `${samples.length} telemetrických vzoriek · posledných 24 hodín.`
+          : "Za posledných 24 hodín zatiaľ nie sú uložené merania.";
+      } catch (error) {
+        status.textContent = `Graf výkonu sa nedá načítať: ${error.message}`;
+        status.classList.add("error");
+      }
+    }
+
+    async function refreshContinuousOptimization() {
+      const button = document.getElementById("continuous-toggle");
+      const status = document.getElementById("continuous-status");
+      try {
+        const response = await fetch("/api/continuous-optimization", { cache: "no-store" });
+        const state = await response.json();
+        if (!response.ok) throw new Error(state.error || `Chyba HTTP ${response.status}`);
+        button.dataset.enabled = String(state.enabled);
+        button.textContent = state.enabled
+          ? "Vypnúť nepretržitú optimalizáciu"
+          : "Zapnúť nepretržitú optimalizáciu";
+        button.disabled = false;
+        setContinuousInputsDisabled(state.enabled);
+        status.classList.toggle("error", Boolean(state.last_error));
+        const lastRun = state.last_run_at
+          ? new Date(state.last_run_at).toLocaleString("sk-SK")
+          : "zatiaľ neprebehol";
+        const nextRun = state.next_run_at
+          ? new Date(state.next_run_at).toLocaleString("sk-SK")
+          : "—";
+        status.textContent = state.enabled
+          ? `Aktívna · posledný prepočet ${lastRun} · ďalší približne ${nextRun}.${state.last_error ? ` Chyba: ${state.last_error}` : ""}`
+          : "Vypnutá.";
+      } catch (error) {
+        status.textContent = `Stav automatiky sa nedá načítať: ${error.message}`;
+        status.classList.add("error");
+        button.disabled = true;
+      }
+      await refreshContinuousResults();
+    }
+
+    async function refreshContinuousResults() {
+      const daysInput = document.getElementById("continuous-days");
+      const status = document.getElementById("continuous-results-status");
+      const days = Number(daysInput.value);
+      if (!Number.isInteger(days) || days < 1 || days > 30) {
+        status.textContent = "Zadaj obdobie od 1 do 30 dní.";
+        status.classList.add("error");
+        return;
+      }
+      try {
+        const response = await fetch(`/api/continuous-results?days=${days}`, { cache: "no-store" });
+        const results = await response.json();
+        if (!response.ok) throw new Error(results.error || `Chyba HTTP ${response.status}`);
+        document.getElementById("continuous-savings").textContent =
+          historyNumber(results.savings_eur, "€");
+        document.getElementById("continuous-actual-cost").textContent =
+          historyNumber(results.actual_cost_eur, "€");
+        document.getElementById("continuous-self-use-cost").textContent =
+          historyNumber(results.self_use_cost_eur, "€");
+        renderSavingsChart(results.daily || []);
+        status.classList.remove("error");
+        status.textContent = results.sessions
+          ? `Posledných ${days} dní · optimalizácia aktívna ${historyNumber(results.active_hours, "h")} · pokrytie telemetriou ${historyNumber(results.coverage_percent, "%")} · úspora je odhad oproti modelovanému Self-use.`
+          : "Za toto obdobie zatiaľ nie sú vyhodnotené merania; výsledky sa objavia po zapnutí automatiky a nazbieraní telemetrie.";
+      } catch (error) {
+        status.textContent = `Výsledky sa nedajú načítať: ${error.message}`;
+        status.classList.add("error");
+      }
+    }
+
+    async function toggleContinuousOptimization() {
+      const button = document.getElementById("continuous-toggle");
+      const enabled = button.dataset.enabled !== "true";
+      const settings = readOptimizationSettings();
+      if (enabled) {
+        saveOptimizationSettings(settings);
+        const confirmed = window.confirm(
+          "Zapnúť nepretržitú optimalizáciu? Appka bude každú hodinu prepočítavať 24-hodinový plán a podľa neho automaticky meniť režim meniča. Server aj spojenie so SofarCloud musia zostať dostupné. Vypnutie automatiky zruší plán a pokúsi sa vrátiť menič do Self-use."
+        );
+        if (!confirmed) return;
+      }
+      button.disabled = true;
+      try {
+        const response = await fetch("/api/continuous-optimization", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            enabled,
+            settings: enabled ? settings : undefined,
+            confirmed: enabled
+          })
+        });
+        const state = await response.json();
+        if (!response.ok) throw new Error(state.error || `Chyba HTTP ${response.status}`);
+        await refreshContinuousOptimization();
+      } catch (error) {
+        const status = document.getElementById("continuous-status");
+        status.textContent = error.message;
+        status.classList.add("error");
+        button.disabled = false;
+      }
+    }
+
     function invalidateOptimizationPlan() {
       optimizationPlan = null;
       const applyButton = document.getElementById("apply-optimization");
@@ -911,15 +1450,24 @@
       document.getElementById("discharge-power-value").textContent = event.target.value;
       updateDischargeEstimate();
     });
-    document.getElementById("refresh").addEventListener("click", refresh);
+    document.getElementById("refresh").addEventListener("click", () => {
+      refresh();
+      refreshPowerChart();
+    });
     document.getElementById("refresh-history").addEventListener("click", refreshHistory);
     document.getElementById("apply-mode").addEventListener("click", applyMode);
     document.getElementById("calculate-optimization").addEventListener("click", calculateOptimization);
     document.getElementById("apply-optimization").addEventListener("click", applyOptimization);
+    document.getElementById("continuous-toggle").addEventListener("click", toggleContinuousOptimization);
+    document.getElementById("continuous-days").addEventListener("change", refreshContinuousResults);
     refreshScheduledPlan();
     refreshHistory();
+    refreshPowerChart();
+    refreshContinuousOptimization();
     window.setInterval(refreshScheduledPlan, 10_000);
     window.setInterval(refreshHistory, 60_000);
+    window.setInterval(refreshPowerChart, 300_000);
+    window.setInterval(refreshContinuousOptimization, 60_000);
     for (const id of [
       "optimization-location", "optimization-pv", "optimization-summer",
       "optimization-winter", "optimization-aid"

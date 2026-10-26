@@ -17,6 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY run.py .
+COPY continuous_optimizer.py .
 COPY history.py .
 COPY planner.py .
 COPY multi_window_scheduler.py .

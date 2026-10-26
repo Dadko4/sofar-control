@@ -17,15 +17,16 @@ from datetime import date as date_type, datetime, time as datetime_time, timedel
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import socketio
 
 from history import HistoryStore
+from continuous_optimizer import ContinuousOptimizationController
 from live_metrics import calculate_live_metrics
-from multi_window_scheduler import MultiWindowScheduler
+from multi_window_scheduler import MultiWindowScheduler, compare_plan_with_telemetry
 from planner import BatteryModel, optimize_windows
 
 
@@ -116,6 +117,7 @@ DEVICE_COMMAND_PATH = "/api/device/command"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
 HISTORY_STORE = None
+CONTINUOUS_OPTIMIZER = None
 
 
 def record_history_event(history_store, event_type, summary, details=None):
@@ -554,6 +556,74 @@ def validate_optimization_settings(settings):
         "energy_aid": energy_aid,
         "planning_horizon_hours": planning_horizon_hours,
     }
+
+
+def calculate_optimization(settings, client, history_store):
+    settings = validate_optimization_settings(settings)
+    forecast = get_solar_forecast(settings["location"])
+    status = client.get_status()
+    history_sync_warning = None
+    if history_store is not None:
+        try:
+            history_points_synced = sync_consumption_history(client, history_store)
+            if history_points_synced:
+                LOGGER.info(
+                    "Imported %s historical SofarCloud consumption points.",
+                    history_points_synced,
+                )
+        except SofarCloudError as error:
+            LOGGER.warning(
+                "Historical consumption sync failed at %s (API code=%s).",
+                error.stage,
+                error.api_code,
+            )
+            history_sync_warning = (
+                "SofarCloud historical consumption could not be downloaded; "
+                "the plan uses locally saved history or the seasonal fallback."
+            )
+    result = optimize_day(
+        status,
+        forecast,
+        settings["pv_capacity_kwp"],
+        settings["summer_consumption_kwh"],
+        settings["winter_consumption_kwh"],
+        settings["energy_aid"],
+        history_store=history_store,
+        planning_horizon_hours=settings["planning_horizon_hours"],
+    )
+    if history_sync_warning:
+        result["consumption_history_sync_warning"] = history_sync_warning
+    warning = record_history_event(
+        history_store,
+        "optimization_calculated",
+        f"Optimization calculated for {result['plan_date']}; {len(result.get('windows', []))} charging windows; estimated savings €{result.get('estimated_savings_eur', 0):.2f}.",
+        {
+            "location": result["location"],
+            "plan_date": result["plan_date"],
+            "windows_count": len(result.get("windows", [])),
+            "cost_with_plan_eur": result.get("cost_with_plan_eur"),
+            "cost_self_use_eur": result.get("cost_self_use_eur"),
+            "estimated_savings_eur": result.get("estimated_savings_eur"),
+            "savings_are_estimated": True,
+            "energy_aid": settings["energy_aid"],
+            "pv_capacity_kwp": settings["pv_capacity_kwp"],
+            "summer_consumption_kwh": settings["summer_consumption_kwh"],
+            "winter_consumption_kwh": settings["winter_consumption_kwh"],
+            "consumption_estimate_source": result.get(
+                "consumption_estimate_source"
+            ),
+            "consumption_history_days": result.get("consumption_history_days"),
+            "hourly_consumption_profile_source": result.get(
+                "hourly_consumption_profile_source"
+            ),
+            "hourly_consumption_profile_days": result.get(
+                "hourly_consumption_profile_days"
+            ),
+        },
+    )
+    if warning:
+        result["history_warning"] = warning
+    return result
 
 
 def _local_day_profile_total(target_date, hourly_profile, timezone_info):
@@ -2813,6 +2883,198 @@ def get_scheduled_plan_state():
     return legacy_state
 
 
+def calculate_continuous_results(history_store, days, now=None):
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 30:
+        raise ValueError("Results period must be between 1 and 30 days.")
+    local_now = now or datetime.now(ZoneInfo(TIMEZONE))
+    if local_now.tzinfo is None:
+        raise ValueError("Continuous results time must include a timezone.")
+    end = local_now.astimezone(timezone.utc)
+    local_end = end.astimezone(ZoneInfo(TIMEZONE))
+    first_date = local_end.date() - timedelta(days=days - 1)
+    start = datetime.combine(
+        first_date,
+        datetime_time.min,
+        tzinfo=ZoneInfo(TIMEZONE),
+    ).astimezone(timezone.utc)
+    daily_totals = {}
+    for day_offset in range(days):
+        day = first_date + timedelta(days=day_offset)
+        daily_totals[day.isoformat()] = {
+            "actual_cost": 0.0,
+            "self_use_cost": 0.0,
+            "savings": 0.0,
+            "has_savings": False,
+            "active_seconds": 0.0,
+            "covered_seconds": 0.0,
+        }
+    sessions = history_store.get_continuous_optimization_sessions(
+        start.isoformat(timespec="seconds"),
+        end.isoformat(timespec="seconds"),
+    )
+    battery_model = history_store.get_continuous_optimization_state().get(
+        "battery_model"
+    )
+    if not battery_model:
+        return {
+            "days": days,
+            "savings_eur": None,
+            "actual_cost_eur": None,
+            "self_use_cost_eur": None,
+            "coverage_percent": 0,
+            "active_hours": 0,
+            "sessions": 0,
+            "savings_are_estimated": True,
+            "daily": [
+                {
+                    "date": day,
+                    "savings_eur": None,
+                    "cumulative_savings_eur": None,
+                    "actual_cost_eur": None,
+                    "self_use_cost_eur": None,
+                    "coverage_percent": 0,
+                    "active_hours": 0,
+                }
+                for day in daily_totals
+            ],
+        }
+
+    savings_total = 0.0
+    actual_cost_total = 0.0
+    self_use_cost_total = 0.0
+    covered_seconds_total = 0.0
+    active_seconds_total = 0.0
+    evaluated_sessions = 0
+    for session in sessions:
+        session_start = max(
+            start, datetime.fromisoformat(session["started_at"]).astimezone(timezone.utc)
+        )
+        session_end = min(
+            end,
+            datetime.fromisoformat(session["ended_at"]).astimezone(timezone.utc)
+            if session.get("ended_at")
+            else end,
+        )
+        if session_end <= session_start:
+            continue
+        settings = session["settings"]
+        hourly_plan = []
+        hour = session_start.replace(minute=0, second=0, microsecond=0)
+        while hour < session_end:
+            local_hour = hour.astimezone(ZoneInfo(TIMEZONE))
+            hourly_plan.append(
+                {
+                    "time": hour.isoformat(timespec="minutes"),
+                    "tariff_eur_per_kwh": electricity_price(
+                        local_hour, settings.get("energy_aid", True)
+                    ),
+                }
+            )
+            hour += timedelta(hours=1)
+        actual = compare_plan_with_telemetry(
+            {"hourly_plan": hourly_plan, "battery_model": battery_model},
+            history_store.telemetry_for_period(
+                session_start.isoformat(timespec="seconds"),
+                session_end.isoformat(timespec="seconds"),
+            ),
+            session_start.isoformat(timespec="seconds"),
+            session_end.isoformat(timespec="seconds"),
+        )
+        savings = actual.get("estimated_savings_vs_self_use_eur")
+        actual_cost = actual.get("actual_cost_on_simulation_coverage_eur")
+        self_use_cost = actual.get("self_use_counterfactual_cost_eur")
+        session_seconds = (session_end - session_start).total_seconds()
+        coverage = actual.get("telemetry_coverage_percent", 0) / 100
+        active_seconds_total += session_seconds
+        covered_seconds_total += session_seconds * coverage
+        for hour_result in actual.get("hourly", []):
+            hour_start = datetime.fromisoformat(hour_result["time"]).astimezone(
+                timezone.utc
+            )
+            hour_end = hour_start + timedelta(hours=1)
+            active_start = max(session_start, hour_start)
+            active_end = min(session_end, hour_end)
+            if active_end <= active_start:
+                continue
+            day_key = hour_start.astimezone(ZoneInfo(TIMEZONE)).date().isoformat()
+            daily = daily_totals.get(day_key)
+            if daily is None:
+                continue
+            active_seconds = (active_end - active_start).total_seconds()
+            covered_seconds = min(
+                active_seconds,
+                (hour_result.get("coverage_percent") or 0) * 36,
+            )
+            daily["active_seconds"] += active_seconds
+            daily["covered_seconds"] += covered_seconds
+            daily_actual_cost = hour_result.get("simulation_cost_eur")
+            daily_self_use_cost = hour_result.get("self_use_cost_eur")
+            daily_savings = hour_result.get("estimated_savings_eur")
+            if (
+                daily_actual_cost is not None
+                and daily_self_use_cost is not None
+                and daily_savings is not None
+            ):
+                daily["actual_cost"] += daily_actual_cost
+                daily["self_use_cost"] += daily_self_use_cost
+                daily["savings"] += daily_savings
+                daily["has_savings"] = True
+        if savings is not None and actual_cost is not None and self_use_cost is not None:
+            savings_total += savings
+            actual_cost_total += actual_cost
+            self_use_cost_total += self_use_cost
+            evaluated_sessions += 1
+
+    has_results = evaluated_sessions > 0
+    daily_results = []
+    cumulative_savings = 0.0
+    has_cumulative_savings = False
+    for day, totals in daily_totals.items():
+        has_daily_savings = totals["has_savings"]
+        if has_daily_savings:
+            cumulative_savings += totals["savings"]
+            has_cumulative_savings = True
+        active_seconds = totals["active_seconds"]
+        daily_results.append(
+            {
+                "date": day,
+                "savings_eur": round(totals["savings"], 4)
+                if has_daily_savings
+                else None,
+                "cumulative_savings_eur": round(cumulative_savings, 4)
+                if has_cumulative_savings
+                else None,
+                "actual_cost_eur": round(totals["actual_cost"], 4)
+                if has_daily_savings
+                else None,
+                "self_use_cost_eur": round(totals["self_use_cost"], 4)
+                if has_daily_savings
+                else None,
+                "coverage_percent": round(
+                    totals["covered_seconds"] / active_seconds * 100, 1
+                )
+                if active_seconds
+                else 0,
+                "active_hours": round(active_seconds / 3600, 1),
+            }
+        )
+    return {
+        "days": days,
+        "savings_eur": round(savings_total, 4) if has_results else None,
+        "actual_cost_eur": round(actual_cost_total, 4) if has_results else None,
+        "self_use_cost_eur": round(self_use_cost_total, 4) if has_results else None,
+        "coverage_percent": round(
+            100 * covered_seconds_total / active_seconds_total, 1
+        )
+        if active_seconds_total
+        else 0,
+        "active_hours": round(active_seconds_total / 3600, 1),
+        "sessions": evaluated_sessions,
+        "savings_are_estimated": True,
+        "daily": daily_results,
+    }
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "SofarOpti/0.1"
 
@@ -2831,6 +3093,58 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, DISCHARGE_WATCHDOG.get_state())
         elif self.path == "/api/optimization-plan":
             self._send_json(200, get_scheduled_plan_state())
+        elif self.path == "/api/continuous-optimization":
+            if CONTINUOUS_OPTIMIZER is None:
+                self._send_json(503, {"error": "Continuous optimization is not initialized."})
+            else:
+                self._send_json(200, CONTINUOUS_OPTIMIZER.get_state())
+        elif urlsplit(self.path).path == "/api/telemetry":
+            if HISTORY_STORE is None:
+                self._send_json(503, {"error": "History logging is not initialized."})
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                raw_hours = query.get("hours", ["24"])[0]
+                if not raw_hours.isdigit() or not 1 <= int(raw_hours) <= 48:
+                    raise ValueError("Telemetry chart period must be between 1 and 48 hours.")
+                end = datetime.now(timezone.utc)
+                start = end - timedelta(hours=int(raw_hours))
+                samples = HISTORY_STORE.telemetry_chart_period(
+                    start.isoformat(timespec="seconds"),
+                    end.isoformat(timespec="seconds"),
+                )
+                self._send_json(
+                    200,
+                    {
+                        "start": start.isoformat(timespec="seconds"),
+                        "end": end.isoformat(timespec="seconds"),
+                        "samples": samples,
+                    },
+                )
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+            except sqlite3.Error as error:
+                LOGGER.exception("Could not load telemetry chart data: %s", error)
+                self._send_json(503, {"error": "Could not load telemetry chart data."})
+        elif urlsplit(self.path).path == "/api/continuous-results":
+            if HISTORY_STORE is None:
+                self._send_json(503, {"error": "History logging is not initialized."})
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                raw_days = query.get("days", ["7"])[0]
+                if not raw_days.isdigit():
+                    raise ValueError("Results period must be an integer from 1 to 30 days.")
+                results = calculate_continuous_results(
+                    HISTORY_STORE,
+                    int(raw_days),
+                )
+                self._send_json(200, results)
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+            except (sqlite3.Error, TypeError, KeyError) as error:
+                LOGGER.exception("Could not calculate continuous results: %s", error)
+                self._send_json(503, {"error": "Could not calculate continuous results."})
         elif self.path == "/api/live-metrics":
             try:
                 metrics = calculate_live_metrics(HISTORY_STORE, MULTI_WINDOW_SCHEDULER, TIMEZONE)
@@ -2879,6 +3193,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/mode",
             "/api/optimization",
             "/api/optimization-plan",
+            "/api/continuous-optimization",
         }:
             self.send_error(404)
             return
@@ -2905,10 +3220,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             self._send_json(400, {"error": "Expected a JSON object."})
             return
+        if self.path == "/api/continuous-optimization":
+            self._set_continuous_optimization(payload)
+            return
         if self.path == "/api/optimization":
             self._send_optimization(payload)
             return
         if self.path == "/api/optimization-plan":
+            if CONTINUOUS_OPTIMIZER and CONTINUOUS_OPTIMIZER.get_state()["enabled"]:
+                self._send_json(
+                    409,
+                    {"error": "Disable continuous optimization before scheduling a manual plan."},
+                )
+                return
             if payload.get("confirmed") is not True:
                 self._send_json(400, {"error": "Confirm the scheduled charging plan before saving it."})
                 return
@@ -2966,6 +3290,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if payload.get("confirmed") is not True:
             self._send_json(400, {"error": "Confirm the mode change before sending it."})
             return
+        if CONTINUOUS_OPTIMIZER and CONTINUOUS_OPTIMIZER.get_state()["enabled"]:
+            if payload.get("mode") != "self_use":
+                self._send_json(
+                    409,
+                    {"error": "Disable continuous optimization before choosing another inverter mode."},
+                )
+                return
+            try:
+                CONTINUOUS_OPTIMIZER.set_enabled(False)
+            except Exception as error:
+                LOGGER.exception("Could not stop continuous optimization: %s", error)
+                self._send_json(
+                    503,
+                    {"error": "Continuous optimization was disabled, but the inverter could not be returned to Self-use."},
+                )
+                return
         with MODE_CONTROL_LOCK:
             scheduled_status = SCHEDULED_CHARGE.get_state()["status"]
             multi_window_status = MULTI_WINDOW_SCHEDULER.get_state()["status"]
@@ -3055,6 +3395,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     response["history_warning"] = warning
                 self._send_json(502, response)
 
+    def _set_continuous_optimization(self, payload):
+        if CONTINUOUS_OPTIMIZER is None:
+            self._send_json(503, {"error": "Continuous optimization is not initialized."})
+            return
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            self._send_json(400, {"error": "Enabled must be true or false."})
+            return
+        if enabled and payload.get("confirmed") is not True:
+            self._send_json(400, {"error": "Confirm continuous optimization before enabling it."})
+            return
+        try:
+            settings = None
+            if enabled:
+                settings = validate_optimization_settings(payload.get("settings"))
+                if DISCHARGE_WATCHDOG.get_state()["active"]:
+                    raise RuntimeError("Stop the discharge plan before enabling continuous optimization.")
+                if SCHEDULED_CHARGE.get_state()["status"] in SCHEDULED_CHARGE.ACTIVE_STATUSES:
+                    raise RuntimeError("Cancel the active single-window plan before enabling continuous optimization.")
+                multi_state = MULTI_WINDOW_SCHEDULER.get_state()
+                if (
+                    multi_state.get("status")
+                    in {"pending", "charging", "transitioning", "evaluating"}
+                    and not multi_state.get("continuous_optimization")
+                ):
+                    raise RuntimeError("Cancel the active manual plan before enabling continuous optimization.")
+            state = CONTINUOUS_OPTIMIZER.set_enabled(enabled, settings)
+            self._send_json(202, state)
+        except ValueError as error:
+            self._send_json(400, {"error": str(error)})
+        except RuntimeError as error:
+            self._send_json(409, {"error": str(error)})
+        except Exception as error:
+            LOGGER.exception("Could not update continuous optimization: %s", error)
+            self._send_json(503, {"error": "Could not update continuous optimization."})
+
     def _is_authorized(self):
         if not WEB_USERNAME and not WEB_PASSWORD:
             return True
@@ -3098,79 +3474,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _send_optimization(self, settings):
         try:
-            settings = validate_optimization_settings(settings)
-            forecast = get_solar_forecast(settings["location"])
-            status = CLIENT.get_status()
-            history_sync_warning = None
-            if CLIENT.history_store is not None:
-                try:
-                    history_points_synced = sync_consumption_history(
-                        CLIENT,
-                        CLIENT.history_store,
-                    )
-                    if history_points_synced:
-                        LOGGER.info(
-                            "Imported %s historical SofarCloud consumption points.",
-                            history_points_synced,
-                        )
-                except SofarCloudError as error:
-                    LOGGER.warning(
-                        "Historical consumption sync failed at %s (API code=%s).",
-                        error.stage,
-                        error.api_code,
-                    )
-                    history_sync_warning = (
-                        "SofarCloud historical consumption could not be downloaded; "
-                        "the plan uses locally saved history or the seasonal fallback."
-                    )
-            result = optimize_day(
-                status,
-                forecast,
-                settings["pv_capacity_kwp"],
-                settings["summer_consumption_kwh"],
-                settings["winter_consumption_kwh"],
-                settings["energy_aid"],
-                history_store=CLIENT.history_store,
-                planning_horizon_hours=settings["planning_horizon_hours"],
-            )
-            if history_sync_warning:
-                result["consumption_history_sync_warning"] = history_sync_warning
-            warning = record_history_event(
-                CLIENT.history_store,
-                "optimization_calculated",
-                f"Optimization calculated for {result['plan_date']}; {len(result.get('windows', []))} charging windows; estimated savings €{result.get('estimated_savings_eur', 0):.2f}.",
-                {
-                    "location": result["location"],
-                    "plan_date": result["plan_date"],
-                    "windows_count": len(result.get("windows", [])),
-                    "cost_with_plan_eur": result.get("cost_with_plan_eur"),
-                    "cost_self_use_eur": result.get("cost_self_use_eur"),
-                    "estimated_savings_eur": result.get("estimated_savings_eur"),
-                    "savings_are_estimated": True,
-                    "energy_aid": settings["energy_aid"],
-                    "pv_capacity_kwp": settings["pv_capacity_kwp"],
-                    "summer_consumption_kwh": settings[
-                        "summer_consumption_kwh"
-                    ],
-                    "winter_consumption_kwh": settings[
-                        "winter_consumption_kwh"
-                    ],
-                    "consumption_estimate_source": result.get(
-                        "consumption_estimate_source"
-                    ),
-                    "consumption_history_days": result.get(
-                        "consumption_history_days"
-                    ),
-                    "hourly_consumption_profile_source": result.get(
-                        "hourly_consumption_profile_source"
-                    ),
-                    "hourly_consumption_profile_days": result.get(
-                        "hourly_consumption_profile_days"
-                    ),
-                },
-            )
-            if warning:
-                result["history_warning"] = warning
+            result = calculate_optimization(settings, CLIENT, CLIENT.history_store)
             self._send_json(200, result)
         except ValueError as error:
             self._send_json(400, {"error": str(error), "stage": "validation"})
@@ -3245,16 +3549,38 @@ def main():
         )
     if bool(WEB_USERNAME) != bool(WEB_PASSWORD):
         raise SystemExit("Set both SOFAR_WEB_USERNAME and SOFAR_WEB_PASSWORD, or leave both empty.")
-    global HISTORY_STORE, TELEMETRY_SAMPLER
+    global HISTORY_STORE, TELEMETRY_SAMPLER, CONTINUOUS_OPTIMIZER
     HISTORY_STORE = HistoryStore(DATA_DIR / "history.sqlite3")
     CLIENT.history_store = HISTORY_STORE
     SCHEDULED_CHARGE.history_store = HISTORY_STORE
     MULTI_WINDOW_SCHEDULER.history_store = HISTORY_STORE
     TELEMETRY_SAMPLER = TelemetrySampler(CLIENT, HISTORY_STORE)
+
+    def disable_continuous_plan():
+        state = MULTI_WINDOW_SCHEDULER.get_state()
+        if state.get("status") in {
+            "pending",
+            "charging",
+            "transitioning",
+            "evaluating",
+        }:
+            MULTI_WINDOW_SCHEDULER.cancel()
+            with MODE_CONTROL_LOCK:
+                CLIENT.set_energy_storage_mode("self_use", confirmed=True)
+
+    CONTINUOUS_OPTIMIZER = ContinuousOptimizationController(
+        HISTORY_STORE,
+        MULTI_WINDOW_SCHEDULER,
+        lambda settings: calculate_optimization(settings, CLIENT, CLIENT.history_store),
+        disable_continuous_plan,
+        TIMEZONE,
+        LOGGER,
+    )
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), DashboardHandler)
     SCHEDULED_CHARGE.start()
     MULTI_WINDOW_SCHEDULER.start()
     TELEMETRY_SAMPLER.start()
+    CONTINUOUS_OPTIMIZER.start()
     LOGGER.info("Dashboard available at http://%s:%s", WEB_HOST, WEB_PORT)
     try:
         server.serve_forever()
@@ -3264,6 +3590,7 @@ def main():
         SCHEDULED_CHARGE.stop()
         MULTI_WINDOW_SCHEDULER.stop()
         TELEMETRY_SAMPLER.stop()
+        CONTINUOUS_OPTIMIZER.stop()
         server.server_close()
 
 

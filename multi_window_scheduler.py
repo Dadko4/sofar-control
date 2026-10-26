@@ -57,10 +57,14 @@ def compare_plan_with_telemetry(
             "consumption_kwh": 0.0,
             "grid_import_kwh": 0.0,
             "cost_eur": 0.0,
+            "simulation_cost_eur": 0.0,
+            "self_use_cost_eur": 0.0,
             "covered_seconds": 0.0,
             "sample_count": 0,
             "soc_end": None,
             "has_grid_data": False,
+            "has_simulation_cost": False,
+            "has_self_use_cost": False,
         }
         price_by_hour[hour] = _finite_number(row.get("tariff_eur_per_kwh"))
 
@@ -175,6 +179,11 @@ def compare_plan_with_telemetry(
                 actual["consumption_kwh"] += consumption_kw * duration_hours
                 actual["covered_seconds"] += duration_seconds
                 covered_seconds += duration_seconds
+                if grid_cost is not None:
+                    actual["simulation_cost_eur"] += grid_cost * (
+                        duration_seconds / interval_seconds
+                    )
+                    actual["has_simulation_cost"] = True
                 price = price_by_hour.get(hour)
                 if price is not None:
                     replay_samples.append(
@@ -216,33 +225,6 @@ def compare_plan_with_telemetry(
                 actual["cost_eur"] += (grid_cost or 0.0) * fraction
             cursor = segment_end
 
-    hourly = []
-    for hour, actual in sorted(actual_by_hour.items()):
-        hourly.append(
-            {
-                "time": actual["time"],
-                "solar_kwh": round(actual["solar_kwh"], 3)
-                if actual["covered_seconds"]
-                else None,
-                "consumption_kwh": round(actual["consumption_kwh"], 3)
-                if actual["covered_seconds"]
-                else None,
-                "grid_import_kwh": round(actual["grid_import_kwh"], 3)
-                if actual["has_grid_data"]
-                else None,
-                "cost_eur": round(actual["cost_eur"], 4)
-                if actual["has_grid_data"]
-                else None,
-                "soc_end": round(actual["soc_end"], 1)
-                if actual["soc_end"] is not None
-                else None,
-                "coverage_percent": round(
-                    min(100.0, actual["covered_seconds"] / 3600 * 100), 1
-                ),
-                "sample_count": actual["sample_count"],
-            }
-        )
-
     self_use_cost = None
     battery_data = forecast.get("battery_model")
     if (
@@ -265,6 +247,54 @@ def compare_plan_with_telemetry(
             battery,
         )
         self_use_cost = round(self_use["cost_eur"], 4)
+        previous_cumulative = 0.0
+        for point in self_use["points"]:
+            hourly_cost = point["cumulative_cost_eur"] - previous_cumulative
+            previous_cumulative = point["cumulative_cost_eur"]
+            hour = point["start"].astimezone(timezone.utc)
+            hour = hour.replace(minute=0, second=0, microsecond=0)
+            actual = actual_by_hour.get(hour)
+            if actual is not None:
+                actual["self_use_cost_eur"] += hourly_cost
+                actual["has_self_use_cost"] = True
+
+    hourly = []
+    for hour, actual in sorted(actual_by_hour.items()):
+        hourly.append(
+            {
+                "time": actual["time"],
+                "solar_kwh": round(actual["solar_kwh"], 3)
+                if actual["covered_seconds"]
+                else None,
+                "consumption_kwh": round(actual["consumption_kwh"], 3)
+                if actual["covered_seconds"]
+                else None,
+                "grid_import_kwh": round(actual["grid_import_kwh"], 3)
+                if actual["has_grid_data"]
+                else None,
+                "cost_eur": round(actual["cost_eur"], 4)
+                if actual["has_grid_data"]
+                else None,
+                "simulation_cost_eur": round(actual["simulation_cost_eur"], 4)
+                if actual["has_simulation_cost"]
+                else None,
+                "self_use_cost_eur": round(actual["self_use_cost_eur"], 4)
+                if actual["has_self_use_cost"]
+                else None,
+                "estimated_savings_eur": round(
+                    actual["self_use_cost_eur"] - actual["simulation_cost_eur"], 4
+                )
+                if actual["has_simulation_cost"] and actual["has_self_use_cost"]
+                else None,
+                "soc_end": round(actual["soc_end"], 1)
+                if actual["soc_end"] is not None
+                else None,
+                "coverage_percent": round(
+                    min(100.0, actual["covered_seconds"] / 3600 * 100), 1
+                ),
+                "sample_count": actual["sample_count"],
+            }
+        )
 
     horizon_seconds = (coverage_end - start).total_seconds()
     replayed_seconds = sum(sample["hours"] * 3600 for sample in replay_samples)
@@ -376,7 +406,13 @@ class MultiWindowScheduler:
             windows: List of window dicts with charge_start, charge_end, target_soc, grid_charge_kwh
             plan_date: Date string (YYYY-MM-DD)
         """
-        if not isinstance(windows, list) or not windows:
+        if not isinstance(windows, list) or (
+            not windows
+            and not (
+                isinstance(plan_snapshot, dict)
+                and plan_snapshot.get("continuous_optimization") is True
+            )
+        ):
             raise ValueError("At least one charging window is required.")
         if not isinstance(plan_date, str) or not plan_date:
             raise ValueError("Plan date must be a non-empty string.")
@@ -420,6 +456,11 @@ class MultiWindowScheduler:
                     plan_snapshot.get("horizon_end")
                     if isinstance(plan_snapshot, dict)
                     else None
+                ),
+                "continuous_optimization": (
+                    plan_snapshot.get("continuous_optimization") is True
+                    if isinstance(plan_snapshot, dict)
+                    else False
                 ),
             }
             self._save_state()
