@@ -193,6 +193,7 @@ def compare_plan_with_telemetry(
                             "generation_kw": generation_kw,
                             "consumption_kw": consumption_kw,
                             "price": price,
+                            "has_observed_cost": grid_cost is not None,
                         }
                     )
             cursor = segment_end
@@ -226,6 +227,8 @@ def compare_plan_with_telemetry(
             cursor = segment_end
 
     self_use_cost = None
+    matched_self_use_cost = 0.0
+    matched_self_use_coverage_seconds = 0.0
     battery_data = forecast.get("battery_model")
     if (
         replay_samples
@@ -248,9 +251,13 @@ def compare_plan_with_telemetry(
         )
         self_use_cost = round(self_use["cost_eur"], 4)
         previous_cumulative = 0.0
-        for point in self_use["points"]:
+        for sample, point in zip(replay_samples, self_use["points"]):
             hourly_cost = point["cumulative_cost_eur"] - previous_cumulative
             previous_cumulative = point["cumulative_cost_eur"]
+            if not sample["has_observed_cost"]:
+                continue
+            matched_self_use_cost += hourly_cost
+            matched_self_use_coverage_seconds += sample["hours"] * 3600
             hour = point["start"].astimezone(timezone.utc)
             hour = hour.replace(minute=0, second=0, microsecond=0)
             actual = actual_by_hour.get(hour)
@@ -317,10 +324,21 @@ def compare_plan_with_telemetry(
         if matched_cost_intervals
         else None,
         "self_use_counterfactual_cost_eur": self_use_cost,
-        "estimated_savings_vs_self_use_eur": round(
-            self_use_cost - actual_cost_on_simulation_coverage, 4
+        "self_use_cost_on_simulation_coverage_eur": round(
+            matched_self_use_cost, 4
         )
-        if self_use_cost is not None and matched_cost_intervals
+        if matched_self_use_coverage_seconds
+        else None,
+        "cost_comparison_coverage_percent": round(
+            min(100.0, matched_self_use_coverage_seconds / horizon_seconds * 100),
+            1,
+        )
+        if horizon_seconds > 0
+        else 0,
+        "estimated_savings_vs_self_use_eur": round(
+            matched_self_use_cost - actual_cost_on_simulation_coverage, 4
+        )
+        if matched_self_use_coverage_seconds and matched_cost_intervals
         else None,
         "actual_generation_kwh": round(total_generation, 3)
         if covered_seconds

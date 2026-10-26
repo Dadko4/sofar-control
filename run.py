@@ -2982,7 +2982,9 @@ def calculate_continuous_results(history_store, days, now=None):
         )
         savings = actual.get("estimated_savings_vs_self_use_eur")
         actual_cost = actual.get("actual_cost_on_simulation_coverage_eur")
-        self_use_cost = actual.get("self_use_counterfactual_cost_eur")
+        self_use_cost = actual.get("self_use_cost_on_simulation_coverage_eur")
+        if self_use_cost is None:
+            self_use_cost = actual.get("self_use_counterfactual_cost_eur")
         session_seconds = (session_end - session_start).total_seconds()
         coverage = actual.get("telemetry_coverage_percent", 0) / 100
         active_seconds_total += session_seconds

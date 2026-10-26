@@ -223,6 +223,8 @@ def test_plan_comparison_integrates_telemetry_and_labels_self_use_as_counterfact
     assert actual["telemetry_coverage_percent"] == 100
     assert actual["self_use_simulation_coverage_percent"] == 100
     assert actual["self_use_counterfactual_cost_eur"] == 0
+    assert actual["self_use_cost_on_simulation_coverage_eur"] == 0
+    assert actual["cost_comparison_coverage_percent"] == 100
     assert actual["estimated_savings_vs_self_use_eur"] == -0.06
     assert actual["hourly"][0]["grid_import_kwh"] == 0.6
     assert actual["hourly"][0]["simulation_cost_eur"] == 0.06
@@ -275,10 +277,56 @@ def test_plan_comparison_exposes_hourly_savings_without_resetting_battery():
     assert sum(hour["estimated_savings_eur"] for hour in actual["hourly"]) == -0.12
 
 
+def test_self_use_cost_comparison_uses_only_intervals_with_measured_cost():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    forecast = {
+        "hourly_plan": [
+            {"time": start.isoformat(), "tariff_eur_per_kwh": 0.1}
+        ],
+        "battery_model": {
+            "capacity_kwh": 10,
+            "min_energy_kwh": 3,
+            "max_energy_kwh": 9,
+            "charge_efficiency": 0.9,
+            "discharge_efficiency": 0.9,
+        },
+    }
+    telemetry = []
+    for sample_index in range(13):
+        sampled_at = start + timedelta(minutes=5 * sample_index)
+        sample = {
+            "sampled_at": sampled_at.isoformat(),
+            "generation_kw": 1,
+            "consumption_kw": 2,
+            "battery_soc": 30,
+            "observed_grid_import_delta_kwh": 0.05,
+        }
+        if sample_index <= 6:
+            sample["observed_grid_import_cost_with_aid_eur"] = 0.005
+        telemetry.append(sample)
+
+    actual = compare_plan_with_telemetry(
+        forecast,
+        telemetry,
+        start.isoformat(),
+        (start + timedelta(hours=1)).isoformat(),
+    )
+
+    assert actual["self_use_counterfactual_cost_eur"] == 0.1
+    assert actual["actual_cost_on_simulation_coverage_eur"] == 0.03
+    assert actual["self_use_cost_on_simulation_coverage_eur"] == 0.05
+    assert actual["cost_comparison_coverage_percent"] == 50
+    assert actual["estimated_savings_vs_self_use_eur"] == 0.02
+    assert actual["hourly"][0]["simulation_cost_eur"] == 0.03
+    assert actual["hourly"][0]["self_use_cost_eur"] == 0.05
+    assert actual["hourly"][0]["estimated_savings_eur"] == 0.02
+
+
 if __name__ == "__main__":
     test_schedule_windows()
     test_window_execution_timing()
     test_state_persistence()
     test_plan_stays_evaluating_until_horizon_end()
     test_plan_comparison_integrates_telemetry_and_labels_self_use_as_counterfactual()
+    test_self_use_cost_comparison_uses_only_intervals_with_measured_cost()
     print("\n✓ All multi-window scheduler tests passed!")

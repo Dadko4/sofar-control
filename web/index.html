@@ -48,6 +48,14 @@
     .table-wrap { margin-top: 12px; max-width: 100%; overflow-x: auto; }
     .plan-result { margin-top: 12px; padding: 12px; border: 1px solid #283d4d; border-radius: 10px; }
     .plan-result > summary { cursor: pointer; color: #c5d4de; font-weight: 650; }
+    .cost-comparison-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 12px; margin-top: 14px; }
+    .cost-comparison-card { min-width: 0; padding: 14px; border: 1px solid #344b5c; border-radius: 10px; background: #14212c; }
+    .cost-comparison-card h4 { margin: 0 0 8px; color: #d7e4ec; font-size: 1rem; }
+    .cost-comparison-row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid #283d4d; }
+    .cost-comparison-row:last-of-type { border-bottom: 0; }
+    .cost-comparison-row strong { text-align: right; white-space: nowrap; }
+    .cost-comparison-note { margin: 10px 0 0; color: #9eafbd; font-size: .82rem; line-height: 1.45; }
+    .cost-comparison-pending { color: #c5d4de; }
     .chart-panel { min-width: 0; padding: 12px; border: 1px solid #283d4d; border-radius: 10px; background: #14212c; }
     .chart-panel h3 { margin: 0 0 10px; color: #c5d4de; font-size: 1rem; }
     .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 12px; margin-top: 12px; }
@@ -196,7 +204,7 @@
         <span id="history-status" class="label" role="status">Načítavam históriu…</span>
       </div>
       <h3 class="section-title">Výsledky plánov</h3>
-      <p class="hint">Po skončení plánovacieho horizontu sa dá rozkliknúť predpoveď oproti telemetrii: výroba, spotreba, import, náklady a SOC. Self-use je simulovaný proti nameranej výrobe a spotrebe; pokrytie telemetrie ukazuje úplnosť merania.</p>
+      <p class="hint">Rozkliknutý plán porovná predikované náklady s plánom a v Self-use so skutočnými nákladmi po skončení horizontu. Skutočný náklad sa opiera o merania počítadla; Self-use sa simuluje z nameranej výroby, spotreby a počiatočného SOC. Pokrytie ukazuje úplnosť porovnania.</p>
       <div id="plan-results" class="table-wrap"></div>
       <h3 class="section-title">Udalosti a plány</h3>
       <div id="event-history" class="table-wrap"></div>
@@ -412,6 +420,102 @@
       line.textContent = text;
       if (strong) line.style.fontWeight = "700";
       container.append(line);
+    }
+
+    function appendCostMetric(container, label, value, unit = "€") {
+      const row = document.createElement("div");
+      row.className = "cost-comparison-row";
+      const name = document.createElement("span");
+      name.textContent = label;
+      const amount = document.createElement("strong");
+      amount.textContent = historyNumber(value, unit);
+      row.append(name, amount);
+      container.append(row);
+    }
+
+    function renderPlanCostComparison(container, forecast, actual, planStatus) {
+      const grid = document.createElement("div");
+      grid.className = "cost-comparison-grid";
+
+      const forecastCard = document.createElement("section");
+      forecastCard.className = "cost-comparison-card";
+      const forecastHeading = document.createElement("h4");
+      forecastHeading.textContent = "Predikcia pre celý horizont";
+      forecastCard.append(forecastHeading);
+      const predictedSavings = Number.isFinite(forecast.cash_savings_eur)
+        ? forecast.cash_savings_eur
+        : Number.isFinite(forecast.cost_self_use_eur) &&
+            Number.isFinite(forecast.cost_with_plan_eur)
+          ? forecast.cost_self_use_eur - forecast.cost_with_plan_eur
+          : null;
+      appendCostMetric(forecastCard, "S odporúčaným plánom", forecast.cost_with_plan_eur);
+      appendCostMetric(forecastCard, "V Self-use", forecast.cost_self_use_eur);
+      appendCostMetric(forecastCard, "Rozdiel nákladov", predictedSavings);
+      const forecastNote = document.createElement("p");
+      forecastNote.className = "cost-comparison-note";
+      forecastNote.textContent = "Rozdiel je Self-use mínus plán; nezahŕňa hodnotu energie zostávajúcej v batérii.";
+      forecastCard.append(forecastNote);
+
+      const actualCard = document.createElement("section");
+      actualCard.className = "cost-comparison-card";
+      const actualHeading = document.createElement("h4");
+      actualHeading.textContent = "Po pláne: skutočnosť a Self-use model";
+      actualCard.append(actualHeading);
+      if (actual) {
+        const hasMatchedSelfUseCost = Number.isFinite(
+          actual.self_use_cost_on_simulation_coverage_eur
+        );
+        const matchedSelfUseCost = hasMatchedSelfUseCost
+          ? actual.self_use_cost_on_simulation_coverage_eur
+          : actual.self_use_counterfactual_cost_eur;
+        const comparisonCoverage = Number.isFinite(
+          actual.cost_comparison_coverage_percent
+        )
+          ? actual.cost_comparison_coverage_percent
+          : actual.self_use_simulation_coverage_percent;
+        appendCostMetric(
+          actualCard,
+          "Plán – náklad na porovnateľných intervaloch",
+          actual.actual_cost_on_simulation_coverage_eur
+        );
+        appendCostMetric(
+          actualCard,
+          hasMatchedSelfUseCost
+            ? "Self-use – simulácia na rovnakých intervaloch"
+            : "Self-use – simulácia na dostupnom rozsahu",
+          matchedSelfUseCost
+        );
+        appendCostMetric(
+          actualCard,
+          hasMatchedSelfUseCost
+            ? "Rozdiel na porovnateľných intervaloch"
+            : "Rozdiel (starší odhad)",
+          actual.estimated_savings_vs_self_use_eur
+        );
+        appendCostMetric(
+          actualCard,
+          "Nameraný náklad za celý horizont",
+          actual.actual_cost_with_aid_eur
+        );
+        const actualNote = document.createElement("p");
+        actualNote.className = "cost-comparison-note";
+        actualNote.textContent = hasMatchedSelfUseCost
+          ? `Pokrytie porovnania ${historyNumber(comparisonCoverage, "%")}; telemetria ${historyNumber(actual.telemetry_coverage_percent, "%")}. Self-use je kontrafaktuálna simulácia výroby, spotreby a počiatočného SOC, nie samostatné meranie.`
+          : `Starší záznam nerozlišuje cenu Self-use na rovnakých intervaloch; zobrazuje model na celom dostupnom rozsahu (${historyNumber(comparisonCoverage, "%")}).`;
+        actualCard.append(actualNote);
+      } else {
+        appendCostMetric(actualCard, "Skutočný náklad plánu", null);
+        appendCostMetric(actualCard, "Self-use podľa skutočných dát", null);
+        const pendingNote = document.createElement("p");
+        pendingNote.className = "cost-comparison-note cost-comparison-pending";
+        pendingNote.textContent = planStatus === "evaluating"
+          ? "Plánovacie okná sa skončili; výsledok sa doplní po skončení horizontu."
+          : "Skutočné náklady a Self-use simulácia sa doplnia po vyhodnotení celého horizontu.";
+        actualCard.append(pendingNote);
+      }
+
+      grid.append(forecastCard, actualCard);
+      container.append(grid);
     }
 
     function appendHistoryTable(container, headings, rows) {
@@ -859,19 +963,12 @@
         summary.textContent = `${plan.plan_date || "Plán"} · ${statusNames[plan.plan_status] || plan.plan_status} · ${start} – ${end}`;
         details.append(summary);
 
-        appendOptimizationLine(
-          details,
-          `Predpoveď: náklady s plánom ${historyNumber(forecast.cost_with_plan_eur, "€")}; Self-use ${historyNumber(forecast.cost_self_use_eur, "€")}; odhadovaná úspora vrátane zostatkovej energie ${historyNumber(forecast.estimated_savings_eur, "€")}.`
-        );
+        renderPlanCostComparison(details, forecast, actual, plan.plan_status);
         if (actual) {
           appendOptimizationLine(
             details,
             `Telemetria: pokrytie ${historyNumber(actual.telemetry_coverage_percent, "%")} zvoleného horizontu, ${actual.telemetry_sample_count || 0} meraní; výroba ${historyNumber(actual.actual_generation_kwh, "kWh")}, spotreba ${historyNumber(actual.actual_consumption_kwh, "kWh")}, import ${historyNumber(actual.actual_grid_import_kwh, "kWh")}, náklady podľa počítadla a tarify ${historyNumber(actual.actual_cost_with_aid_eur, "€")}.`,
             true
-          );
-          appendOptimizationLine(
-            details,
-            `Self-use kontrafaktuálna simulácia: ${historyNumber(actual.self_use_counterfactual_cost_eur, "€")} pri pokrytí ${historyNumber(actual.self_use_simulation_coverage_percent, "%")}; skutočný náklad na rovnakých intervaloch ${historyNumber(actual.actual_cost_on_simulation_coverage_eur, "€")}; odhadovaný rozdiel oproti Self-use ${historyNumber(actual.estimated_savings_vs_self_use_eur, "€")}.`
           );
 
           const actualByTime = new Map(
@@ -904,13 +1001,6 @@
           tableSummary.textContent = "Zobraziť hodinovú tabuľku";
           tableDetails.append(tableSummary, tableContainer);
           details.append(tableDetails);
-        } else {
-          appendOptimizationLine(
-            details,
-            plan.plan_status === "evaluating"
-              ? "Nabíjacie okná skončili; zber telemetrie pokračuje do konca horizontu."
-              : "Skutočné výsledky sa zobrazia po vyhodnotení plánovacieho horizontu."
-          );
         }
         container.append(details);
       }

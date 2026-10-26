@@ -109,7 +109,8 @@ def test_continuous_results_sum_only_enabled_session_estimates():
     actual = {
         "estimated_savings_vs_self_use_eur": 0.5,
         "actual_cost_on_simulation_coverage_eur": 2.0,
-        "self_use_counterfactual_cost_eur": 2.5,
+        "self_use_counterfactual_cost_eur": 2.8,
+        "self_use_cost_on_simulation_coverage_eur": 2.5,
         "telemetry_coverage_percent": 80,
         "hourly": [
             {

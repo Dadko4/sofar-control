@@ -161,7 +161,12 @@ ako kontext výsledku. API: `/api/continuous-optimization` a
 Dashboard priebežne zobrazuje tri SVG grafy bez externej grafovej knižnice:
 24-hodinový priebeh výkonových tokov, dennú a kumulatívnu odhadovanú úsporu
 nepretržitej optimalizácie a porovnanie predpovede so skutočnosťou pri
-vyhodnotených plánoch. Údaje výkonového grafu poskytuje
+vyhodnotených plánoch. Detail každého plánu zobrazuje vedľa seba predikované
+náklady s plánom a v Self-use a po vyhodnotení aj nameraný náklad plánu oproti
+Self-use simulácii na rovnakých intervaloch s dostupným nákladovým meraním.
+Skutočný Self-use režim počas toho istého plánu nemožno súčasne merať, preto
+ide o kontrafaktuálny model; jeho pokrytie je zobrazené pri porovnaní.
+Údaje výkonového grafu poskytuje
 `/api/telemetry?hours=24`; merania sa obnovujú každých päť minút. Znamienko
 výkonu siete je ponechané podľa telemetrie meniča a pri výpadkoch sa v grafe
 nevykresľuje spojitá odhadovaná čiara. Podrobné hodinové tabuľky plánov sú
