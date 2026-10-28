@@ -138,12 +138,14 @@ V sekcii plánovania možno zapnúť automatické prepočítavanie. Automatika p
 24-hodinový posuvný horizont a prepočet spúšťa približne každú hodinu o :55,
 aby nový plán mohol začať od najbližšej celej hodiny. Ak už práve prebieha
 nabíjacie okno, prepočet ho neprepíše a počká na ďalší hodinový cyklus.
-Plánovač môže pri novom výpočte nahradiť čakajúci alebo vyhodnocovaný starší
-automatický plán. Server a spojenie so SofarCloud musia byť dostupné; stav
-zapnutia, nastavenia a priebežná história sa ukladajú do SQLite databázy.
-Reštart servera preto automatiku obnoví.
+Nový výpočet aktualizuje jeden aktívny plánovací záznam; nevytvára nový
+historický záznam pri každom hodinovom prepočte. Server a spojenie so
+SofarCloud musia byť dostupné; stav zapnutia, nastavenia a priebežná história
+sa ukladajú do SQLite databázy. Reštart servera preto automatiku obnoví.
 
 Vypnutie automatiky zruší jej plán a pokúsi sa vrátiť menič do Self-use.
+Aktívny záznam sa uzavrie a zostane v histórii s vyhodnotením telemetrie za
+celý čas behu.
 Ručná zmena režimu na Self-use automatiku tiež vypne; iné ručné režimy a
 plánovanie na požiadanie sú počas jej aktivity blokované, aby si automatika
 navzájom neprepisovala povely. Plánovací horizont je v automatike pevne 24
@@ -166,6 +168,8 @@ náklady s plánom a v Self-use a po vyhodnotení aj nameraný náklad plánu op
 Self-use simulácii na rovnakých intervaloch s dostupným nákladovým meraním.
 Skutočný Self-use režim počas toho istého plánu nemožno súčasne merať, preto
 ide o kontrafaktuálny model; jeho pokrytie je zobrazené pri porovnaní.
+Pri nepretržitej optimalizácii je predikcia najnovší rolling plán, zatiaľ čo
+skutočný výsledok po vypnutí sumarizuje celý čas zapnutého behu.
 Údaje výkonového grafu poskytuje
 `/api/telemetry?hours=24`; merania sa obnovujú každých päť minút. Znamienko
 výkonu siete je ponechané podľa telemetrie meniča a pri výpadkoch sa v grafe

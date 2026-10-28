@@ -440,7 +440,9 @@
       const forecastCard = document.createElement("section");
       forecastCard.className = "cost-comparison-card";
       const forecastHeading = document.createElement("h4");
-      forecastHeading.textContent = "Predikcia pre celý horizont";
+      forecastHeading.textContent = forecast.continuous_optimization
+        ? "Najnovší rolling plán"
+        : "Predikcia pre celý horizont";
       forecastCard.append(forecastHeading);
       const predictedSavings = Number.isFinite(forecast.cash_savings_eur)
         ? forecast.cash_savings_eur
@@ -459,7 +461,9 @@
       const actualCard = document.createElement("section");
       actualCard.className = "cost-comparison-card";
       const actualHeading = document.createElement("h4");
-      actualHeading.textContent = "Po pláne: skutočnosť a Self-use model";
+      actualHeading.textContent = forecast.continuous_optimization
+        ? "Výsledok celého behu"
+        : "Po pláne: skutočnosť a Self-use model";
       actualCard.append(actualHeading);
       if (actual) {
         const hasMatchedSelfUseCost = Number.isFinite(
@@ -508,7 +512,9 @@
         appendCostMetric(actualCard, "Self-use podľa skutočných dát", null);
         const pendingNote = document.createElement("p");
         pendingNote.className = "cost-comparison-note cost-comparison-pending";
-        pendingNote.textContent = planStatus === "evaluating"
+        pendingNote.textContent = forecast.continuous_optimization
+          ? "Záznam sa aktualizuje pri každom prepočítaní. Finálne vyhodnotenie sa uloží po vypnutí optimalizácie."
+          : planStatus === "evaluating"
           ? "Plánovacie okná sa skončili; výsledok sa doplní po skončení horizontu."
           : "Skutočné náklady a Self-use simulácia sa doplnia po vyhodnotení celého horizontu.";
         actualCard.append(pendingNote);
@@ -931,10 +937,74 @@
       container.append(grid);
     }
 
+    function renderContinuousSessionEvaluation(container, actual) {
+      const hourly = actual.hourly || [];
+      if (hourly.length === 0) return;
+
+      const chartPanel = document.createElement("section");
+      chartPanel.className = "chart-panel";
+      const chart = document.createElement("div");
+      renderLineChart(
+        chart,
+        [
+          {
+            name: "Náklad v optimalizovanom režime",
+            color: "#f6c85f",
+            points: hourly.map(hour => ({
+              time: hour.time,
+              value: hour.simulation_cost_eur
+            }))
+          },
+          {
+            name: "Self-use · model",
+            color: "#5dade2",
+            points: hourly.map(hour => ({
+              time: hour.time,
+              value: hour.self_use_cost_eur
+            }))
+          }
+        ],
+        "Hodinový náklad počas behu",
+        "€"
+      );
+      chartPanel.append(chart);
+      container.append(chartPanel);
+
+      const rows = hourly.map(hour => [
+        new Date(hour.time).toLocaleString("sk-SK", {
+          day: "2-digit",
+          month: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit"
+        }),
+        historyNumber(hour.simulation_cost_eur, "€"),
+        historyNumber(hour.self_use_cost_eur, "€"),
+        historyNumber(hour.estimated_savings_eur, "€"),
+        historyNumber(hour.coverage_percent, "%")
+      ]);
+      const tableContainer = document.createElement("div");
+      tableContainer.className = "table-wrap";
+      appendHistoryTable(
+        tableContainer,
+        ["Hodina", "Optimalizovaný režim", "Self-use model", "Rozdiel", "Pokrytie"],
+        rows
+      );
+      const tableDetails = document.createElement("details");
+      tableDetails.className = "plan-result";
+      const tableSummary = document.createElement("summary");
+      tableSummary.textContent = "Zobraziť hodinové vyhodnotenie behu";
+      tableDetails.append(tableSummary, tableContainer);
+      container.append(tableDetails);
+    }
+
     function renderOptimizationResults(plans) {
       const container = document.getElementById("plan-results");
       container.replaceChildren();
-      if (plans.length === 0) {
+      const visiblePlans = plans.filter(plan => !(
+        plan.plan_status === "replaced" &&
+        plan.forecast?.continuous_optimization
+      ));
+      if (visiblePlans.length === 0) {
         container.textContent = "Zatiaľ nie sú uložené žiadne plány.";
         return;
       }
@@ -944,21 +1014,24 @@
         charging: "nabíja",
         evaluating: "vyhodnocuje telemetriu",
         completed: "vyhodnotený",
+        continuous: "beží",
         cancelled: "zrušený",
         replaced: "nahradený",
         failed: "zlyhal"
       };
-      for (const plan of plans) {
+      for (const plan of visiblePlans) {
         const forecast = plan.forecast || {};
         const actual = plan.actual;
         const details = document.createElement("details");
         details.className = "plan-result";
         const summary = document.createElement("summary");
-        const start = plan.horizon_start
-          ? new Date(plan.horizon_start).toLocaleString("sk-SK")
+        const startTime = actual?.continuous_session_start || plan.horizon_start;
+        const endTime = actual?.continuous_session_end || plan.horizon_end;
+        const start = startTime
+          ? new Date(startTime).toLocaleString("sk-SK")
           : "—";
-        const end = plan.horizon_end
-          ? new Date(plan.horizon_end).toLocaleString("sk-SK")
+        const end = endTime
+          ? new Date(endTime).toLocaleString("sk-SK")
           : "—";
         summary.textContent = `${plan.plan_date || "Plán"} · ${statusNames[plan.plan_status] || plan.plan_status} · ${start} – ${end}`;
         details.append(summary);
@@ -971,36 +1044,40 @@
             true
           );
 
-          const actualByTime = new Map(
-            (actual.hourly || []).map(hour => [hour.time, hour])
-          );
-          const rows = (forecast.hourly_plan || []).map(hour => {
-            const measured = actualByTime.get(hour.time) || {};
-            return [
-              new Date(hour.time).toLocaleString("sk-SK", {
-                day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"
-              }),
-              `${historyNumber(hour.solar_kwh)} / ${historyNumber(measured.solar_kwh)}`,
-              `${historyNumber(hour.consumption_kwh)} / ${historyNumber(measured.consumption_kwh)}`,
-              `${historyNumber(hour.grid_import_kwh)} / ${historyNumber(measured.grid_import_kwh)}`,
-              `${historyNumber(hour.cost_eur)} / ${historyNumber(measured.cost_eur, "€")}`,
-              `${historyNumber(hour.soc_end, "%")} / ${historyNumber(measured.soc_end, "%")}`
-            ];
-          });
-          const tableContainer = document.createElement("div");
-          tableContainer.className = "table-wrap";
-          appendHistoryTable(
-            tableContainer,
-            ["Čas", "FVE pred / skutočná kWh", "Spotreba pred / skutočná kWh", "Import pred / skutočný kWh", "Náklad pred / skutočný €", "SOC pred / skutočný"],
-            rows
-          );
-          renderPlanComparisonCharts(details, forecast, actual);
-          const tableDetails = document.createElement("details");
-          tableDetails.className = "plan-result";
-          const tableSummary = document.createElement("summary");
-          tableSummary.textContent = "Zobraziť hodinovú tabuľku";
-          tableDetails.append(tableSummary, tableContainer);
-          details.append(tableDetails);
+          if (forecast.continuous_optimization) {
+            renderContinuousSessionEvaluation(details, actual);
+          } else {
+            const actualByTime = new Map(
+              (actual.hourly || []).map(hour => [hour.time, hour])
+            );
+            const rows = (forecast.hourly_plan || []).map(hour => {
+              const measured = actualByTime.get(hour.time) || {};
+              return [
+                new Date(hour.time).toLocaleString("sk-SK", {
+                  day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"
+                }),
+                `${historyNumber(hour.solar_kwh)} / ${historyNumber(measured.solar_kwh)}`,
+                `${historyNumber(hour.consumption_kwh)} / ${historyNumber(measured.consumption_kwh)}`,
+                `${historyNumber(hour.grid_import_kwh)} / ${historyNumber(measured.grid_import_kwh)}`,
+                `${historyNumber(hour.cost_eur)} / ${historyNumber(measured.cost_eur, "€")}`,
+                `${historyNumber(hour.soc_end, "%")} / ${historyNumber(measured.soc_end, "%")}`
+              ];
+            });
+            const tableContainer = document.createElement("div");
+            tableContainer.className = "table-wrap";
+            appendHistoryTable(
+              tableContainer,
+              ["Čas", "FVE pred / skutočná kWh", "Spotreba pred / skutočná kWh", "Import pred / skutočný kWh", "Náklad pred / skutočný €", "SOC pred / skutočný"],
+              rows
+            );
+            renderPlanComparisonCharts(details, forecast, actual);
+            const tableDetails = document.createElement("details");
+            tableDetails.className = "plan-result";
+            const tableSummary = document.createElement("summary");
+            tableSummary.textContent = "Zobraziť hodinovú tabuľku";
+            tableDetails.append(tableSummary, tableContainer);
+            details.append(tableDetails);
+          }
         }
         container.append(details);
       }

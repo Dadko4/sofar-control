@@ -445,17 +445,61 @@ class MultiWindowScheduler:
 
         with self._lock:
             previous_state = dict(self._state)
-        if previous_state.get("plan_id") and previous_state.get("status") in {
-            "pending",
-            "charging",
-            "transitioning",
-            "evaluating",
-        }:
+        is_continuous = (
+            isinstance(plan_snapshot, dict)
+            and plan_snapshot.get("continuous_optimization") is True
+        )
+        session = (
+            self.history_store.get_latest_continuous_optimization_session()
+            if is_continuous and self.history_store is not None
+            else None
+        )
+        continuous_session_id = (
+            session["id"]
+            if isinstance(session, dict) and session.get("ended_at") is None
+            else None
+        )
+        continuous_plan_id = (
+            f"continuous-session-{continuous_session_id}"
+            if continuous_session_id is not None
+            else None
+        )
+        reuse_continuous_plan = (
+            continuous_session_id is not None
+            and previous_state.get("continuous_session_id") == continuous_session_id
+            and previous_state.get("plan_id") == continuous_plan_id
+        )
+        if (
+            previous_state.get("plan_id")
+            and not reuse_continuous_plan
+            and previous_state.get("status") in {
+                "pending",
+                "charging",
+                "transitioning",
+                "evaluating",
+            }
+        ):
             self._record_plan_result("replaced", datetime.now(ZoneInfo(self.timezone_str)))
 
-        plan_id = uuid.uuid4().hex if plan_snapshot is not None else None
+        if continuous_plan_id is not None:
+            plan_id = continuous_plan_id
+        elif plan_snapshot is not None:
+            plan_id = uuid.uuid4().hex
+        else:
+            plan_id = None
         if plan_id and self.history_store is not None:
-            self.history_store.record_optimization_plan(plan_id, plan_snapshot)
+            if reuse_continuous_plan:
+                self.history_store.update_optimization_plan_forecast(
+                    plan_id,
+                    plan_snapshot,
+                    "continuous",
+                )
+            else:
+                self.history_store.record_optimization_plan(
+                    plan_id,
+                    plan_snapshot,
+                    "continuous" if is_continuous else "pending",
+                )
         with self._lock:
             self._state = {
                 "status": "pending",
@@ -476,10 +520,11 @@ class MultiWindowScheduler:
                     else None
                 ),
                 "continuous_optimization": (
-                    plan_snapshot.get("continuous_optimization") is True
+                    is_continuous
                     if isinstance(plan_snapshot, dict)
                     else False
                 ),
+                "continuous_session_id": continuous_session_id,
             }
             self._save_state()
             LOGGER.info(f"Scheduled {len(windows)} charging windows for {plan_date}")
@@ -641,7 +686,7 @@ class MultiWindowScheduler:
                 self._finish_evaluation(now)
             return
     
-    def cancel(self):
+    def cancel(self, record_result=True):
         """Cancel scheduled windows."""
         with self._lock:
             if self._state["status"] not in {
@@ -652,7 +697,7 @@ class MultiWindowScheduler:
             }:
                 return self.get_state()
             state = dict(self._state)
-        if state.get("plan_id"):
+        if state.get("plan_id") and record_result:
             self._record_plan_result(
                 "cancelled", datetime.now(ZoneInfo(self.timezone_str))
             )
@@ -726,7 +771,10 @@ class MultiWindowScheduler:
         )
 
     def _finish_evaluation(self, now):
-        self._record_plan_result("completed", now)
+        with self._lock:
+            is_continuous = self._state.get("continuous_optimization") is True
+        if not is_continuous:
+            self._record_plan_result("completed", now)
         with self._lock:
             if self._state.get("status") == "evaluating":
                 self._state["status"] = "completed"

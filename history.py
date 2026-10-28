@@ -443,11 +443,13 @@ class HistoryStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def record_optimization_plan(self, plan_id, forecast):
+    def record_optimization_plan(self, plan_id, forecast, plan_status="pending"):
         if not isinstance(plan_id, str) or not plan_id:
             raise ValueError("Optimization plan ID must be a non-empty string.")
         if not isinstance(forecast, dict):
             raise ValueError("Optimization forecast must be an object.")
+        if not isinstance(plan_status, str) or not plan_status:
+            raise ValueError("Optimization plan status must be a non-empty string.")
         plan_date = forecast.get("plan_date")
         horizon_start = forecast.get("horizon_start")
         horizon_end = forecast.get("horizon_end")
@@ -473,17 +475,66 @@ class HistoryStore:
                 INSERT INTO optimization_plans (
                     plan_id, plan_date, horizon_start, horizon_end, plan_status,
                     forecast_json, actual_json, created_at
-                ) VALUES (?, ?, ?, ?, 'pending', ?, NULL, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
                 """,
                 (
                     plan_id,
                     plan_date,
                     start.isoformat(timespec="minutes"),
                     end.isoformat(timespec="minutes"),
+                    plan_status,
                     forecast_json,
                     created_at,
                 ),
             )
+
+    def update_optimization_plan_forecast(self, plan_id, forecast, plan_status):
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValueError("Optimization plan ID must be a non-empty string.")
+        if not isinstance(forecast, dict):
+            raise ValueError("Optimization forecast must be an object.")
+        plan_date = forecast.get("plan_date")
+        try:
+            start = datetime.fromisoformat(forecast.get("horizon_start"))
+            end = datetime.fromisoformat(forecast.get("horizon_end"))
+        except (TypeError, ValueError):
+            raise ValueError("Optimization forecast must include a valid horizon.") from None
+        if (
+            start.tzinfo is None
+            or end.tzinfo is None
+            or end <= start
+            or not isinstance(plan_date, str)
+            or not plan_date
+        ):
+            raise ValueError("Optimization forecast must include a valid date and horizon.")
+        if not isinstance(plan_status, str) or not plan_status:
+            raise ValueError("Optimization plan status must be a non-empty string.")
+        forecast_json = json.dumps(
+            forecast,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE optimization_plans
+                SET plan_date = ?, horizon_start = ?, horizon_end = ?,
+                    plan_status = ?, forecast_json = ?, actual_json = NULL,
+                    completed_at = NULL
+                WHERE plan_id = ?
+                """,
+                (
+                    plan_date,
+                    start.isoformat(timespec="minutes"),
+                    end.isoformat(timespec="minutes"),
+                    plan_status,
+                    forecast_json,
+                    plan_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Optimization plan {plan_id} was not found.")
 
     def update_optimization_plan_result(self, plan_id, plan_status, actual):
         if not isinstance(plan_id, str) or not plan_id:
@@ -709,6 +760,44 @@ class HistoryStore:
             }
             for row in rows
         ]
+
+    def get_continuous_optimization_session(self, session_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT id, started_at, ended_at, settings_json
+                FROM continuous_optimization_sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            "settings": json.loads(row["settings_json"]),
+        }
+
+    def get_latest_continuous_optimization_session(self):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT id, started_at, ended_at, settings_json
+                FROM continuous_optimization_sessions
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            "settings": json.loads(row["settings_json"]),
+        }
 
     def update_continuous_optimization_runtime(
         self,

@@ -2883,6 +2883,78 @@ def get_scheduled_plan_state():
     return legacy_state
 
 
+def calculate_continuous_session_result(history_store, session, battery_model):
+    if not isinstance(session, dict) or not isinstance(session.get("settings"), dict):
+        raise ValueError("Continuous optimization session is invalid.")
+    try:
+        session_start = datetime.fromisoformat(session["started_at"])
+        session_end = datetime.fromisoformat(session["ended_at"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Continuous optimization session must have start and end times.") from None
+    if (
+        session_start.tzinfo is None
+        or session_end.tzinfo is None
+        or session_end <= session_start
+    ):
+        raise ValueError("Continuous optimization session times must be increasing and timezone-aware.")
+
+    start_utc = session_start.astimezone(timezone.utc)
+    end_utc = session_end.astimezone(timezone.utc)
+    hourly_plan = []
+    hour = start_utc.replace(minute=0, second=0, microsecond=0)
+    while hour < end_utc:
+        local_hour = hour.astimezone(ZoneInfo(TIMEZONE))
+        hourly_plan.append(
+            {
+                "time": hour.isoformat(timespec="minutes"),
+                "tariff_eur_per_kwh": electricity_price(
+                    local_hour, session["settings"].get("energy_aid", True)
+                ),
+            }
+        )
+        hour += timedelta(hours=1)
+
+    actual = compare_plan_with_telemetry(
+        {"hourly_plan": hourly_plan, "battery_model": battery_model},
+        history_store.telemetry_for_period(
+            start_utc.isoformat(timespec="seconds"),
+            end_utc.isoformat(timespec="seconds"),
+        ),
+        start_utc.isoformat(timespec="seconds"),
+        end_utc.isoformat(timespec="seconds"),
+    )
+    actual["continuous_session_start"] = session_start.isoformat(timespec="minutes")
+    actual["continuous_session_end"] = session_end.isoformat(timespec="minutes")
+    return actual
+
+
+def finalize_continuous_optimization_plan(
+    history_store, plan_id, session_id, battery_model
+):
+    session = (
+        history_store.get_continuous_optimization_session(session_id)
+        if session_id is not None
+        else None
+    )
+    if session is None:
+        session = history_store.get_latest_continuous_optimization_session()
+    if session is None or not session.get("ended_at"):
+        raise ValueError("A closed continuous optimization session was not found.")
+    actual = calculate_continuous_session_result(
+        history_store,
+        session,
+        battery_model,
+    )
+    actual["continuous_optimization"] = True
+    actual["evaluation_status"] = "completed"
+    history_store.update_optimization_plan_result(
+        plan_id,
+        "completed",
+        actual,
+    )
+    return actual
+
+
 def calculate_continuous_results(history_store, days, now=None):
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 30:
         raise ValueError("Results period must be between 1 and 30 days.")
@@ -3560,13 +3632,38 @@ def main():
 
     def disable_continuous_plan():
         state = MULTI_WINDOW_SCHEDULER.get_state()
+        is_continuous = state.get("continuous_optimization") is True
+        session = None
+        if is_continuous:
+            session_id = state.get("continuous_session_id")
+            session = (
+                HISTORY_STORE.get_continuous_optimization_session(session_id)
+                if session_id is not None
+                else None
+            )
+            if session is None:
+                session = HISTORY_STORE.get_latest_continuous_optimization_session()
+        has_closed_session = bool(session and session.get("ended_at"))
         if state.get("status") in {
             "pending",
             "charging",
             "transitioning",
             "evaluating",
         }:
-            MULTI_WINDOW_SCHEDULER.cancel()
+            MULTI_WINDOW_SCHEDULER.cancel(
+                record_result=not (is_continuous and has_closed_session)
+            )
+        try:
+            if is_continuous and state.get("plan_id") and has_closed_session:
+                finalize_continuous_optimization_plan(
+                    HISTORY_STORE,
+                    state["plan_id"],
+                    session.get("id"),
+                    HISTORY_STORE.get_continuous_optimization_state().get(
+                        "battery_model"
+                    ),
+                )
+        finally:
             with MODE_CONTROL_LOCK:
                 CLIENT.set_energy_storage_mode("self_use", confirmed=True)
 
