@@ -51,13 +51,23 @@ plánovací horizont 12, 24 alebo 36 hodín (predvolene 24).
 Nastavenia sa ukladajú iba v danom prehliadači. Open-Meteo geokóduje obec na
 Slovensku a poskytuje hodinové globálne žiarenie; služba nevyžaduje API kľúč.
 
-Horizont začína od najbližšej celej hodiny a končí po zvolenom počte
-skutočných hodín; nejde o pevný čas 06:00 ani o kalendárny deň. Model simuluje
-každú hodinu a vyberá nabíjacie okná porovnaním s režimom Self-use. Používa
-všetky štyri dodané pásma Magna 4T a víkendovú zľavu 12 %. Rozpis zobrazuje
-hodinovú tarifu, odhad FVE a spotreby, SOC, nabíjanie/odber zo siete a
-odhadovaný náklad. Fixný mesačný poplatok 1,50 € sa nemení podľa použitia,
-preto ho výpočet vynecháva.
+Horizont začína od najbližšej štvrthodiny a končí po zvolenom počte
+skutočných hodín; nejde o pevný čas 06:00 ani o kalendárny deň. Optimalizátor
+(`planner.py`) počíta v 15-minútových intervaloch dynamickým programovaním nad
+stavom batérie a vyberá akcie: Self-use alebo nabíjanie zo siete pri 0,5–2 kW.
+Výsledkom sú nabíjacie okná s výkonom v odporúčanom čase, cieľovým SOC a
+hodinový rozpis.
+
+Ceny sú celkové ceny odberu vrátane DPH a distribučných poplatkov (`tariff.py`):
+noc 22–06 (0,117 €/kWh s energopomocou, 0,156 bez nej), ráno/večer špička
+06–09 a 19–22 (0,222 / 0,261), dopoludnie 09–13 (0,129 / 0,167) a popoludnie
+13–19 (0,167 / 0,206). Cez víkend sa 12 % zľava uplatní iba na silovú elektrinu
+(odhad distribučnej zložky 0,052 €/kWh), nie na celú cenu. Energia zostávajúca
+v batérii na konci horizontu sa oceňuje priemernou cenou nasledujúcich 24 hodín
+krát účinnosť vybíjania. Opotrebenie batérie sa rátá 0,01 €/kWh
+(`SOFAR_BATTERY_WEAR_EUR_KWH`). Rozpis zobrazuje hodinovú tarifu, odhad FVE a
+spotreby, SOC, nabíjanie/odber zo siete a odhadovaný náklad. Fixný mesačný
+poplatok 1,50 € sa nemení podľa použitia, preto ho výpočet vynecháva.
 
 Po výslovnom potvrdení sa plán uloží na server. Server v odporúčanom čase
 prepne menič do nabíjania pri najviac 2 kW a na konci okna pošle príkaz
@@ -109,9 +119,16 @@ aspoň 18 pokrytých hodín za deň). Profil vychádza z priemerného výkonu do
 SofarCloud `use_power` v každej hodine a upraví sa tak, aby jeho súčet zodpovedal
 dennému odhadu. Inak sa spotreba rozdelí rovnomerne. Predpoveď žiarenia určuje
 odhad výroby FVE; korekcia spotreby podľa predpovedanej teploty sa zatiaľ
-nepoužíva. Model nezohľadňuje sklon/orientáciu panelov, opotrebenie batérie,
-exportné výnosy ani všetky distribučné poplatky. Denné riadenie vybíjania alebo
+nepoužíva. Ak je nastavený `SOFAR_PV_TILT_DEG`, žiarenie sa berie na naklonenú
+plochu (Open-Meteo GTI) s azimutom `SOFAR_PV_AZIMUTH_DEG` (0 = juh, −90 = východ,
+90 = západ); inak sa používa horizontálne globálne žiarenie. Exportné výnosy sú
+predvolene 0 (`SOFAR_EXPORT_PRICE_EUR_KWH`). Denné riadenie vybíjania alebo
 predaja do siete zatiaľ nie je automatizované.
+
+Porovnanie stratégií na nameraných dňoch (bez zmeny meniča) spúšťa
+`python backtest.py --db data/history.sqlite3 --days 30`; bez databázy
+`python backtest.py --synthetic --days 14`. Výstup porovnáva Self-use, plán
+z predchádzajúceho dňa, plán s dokonalou predpoveďou a to isté s režimom Hold.
 
 ### Vyhodnotenie výsledkov plánov
 
@@ -136,8 +153,9 @@ udalosti a posledné telemetrické vzorky zostávajú dostupné cez `/api/histor
 
 V sekcii plánovania možno zapnúť automatické prepočítavanie. Automatika používa
 24-hodinový posuvný horizont a prepočet spúšťa približne každú hodinu o :55,
-aby nový plán mohol začať od najbližšej celej hodiny. Ak už práve prebieha
-nabíjacie okno, prepočet ho neprepíše a počká na ďalší hodinový cyklus.
+aby nový plán mohol začať od najbližšej štvrthodiny. Ak už práve prebieha
+nabíjacie okno, prepočet ho neprepíše a počká na ďalší hodinový cyklus. Menič sa
+tak v automatike mení najviac raz za hodinu, pretože API SofarCloud je pomalé.
 Nový výpočet aktualizuje jeden aktívny plánovací záznam; nevytvára nový
 historický záznam pri každom hodinovom prepočte. Server a spojenie so
 SofarCloud musia byť dostupné; stav zapnutia, nastavenia a priebežná história

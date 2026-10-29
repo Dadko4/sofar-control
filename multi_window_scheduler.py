@@ -608,6 +608,7 @@ class MultiWindowScheduler:
     def _start_window_charging(self, window):
         """Start charging for a window with retry logic."""
         target_soc = window.get("recommended_target_soc", 80)
+        power_w = window.get("charge_power_w", 2000)
         max_retries = 5
         retry_interval = 120  # 2 min
         
@@ -620,11 +621,11 @@ class MultiWindowScheduler:
                 with self.mode_lock:
                     self.client.set_energy_storage_mode(
                         "grid_charge",
-                        2000,
+                        power_w,
                         confirmed=True,
                         target_soc=target_soc,
                     )
-                LOGGER.info(f"Window charging started: target SOC {target_soc}%")
+                LOGGER.info(f"Window charging started: {power_w} W, target SOC {target_soc}%")
                 return
             except Exception as e:
                 if attempt < max_retries:

@@ -21,15 +21,14 @@ from run import (
     SofarCloudError,
     TelemetrySampler,
     build_mode_parameters,
-    electricity_price,
     estimate_discharge,
     estimate_daily_consumption,
     estimate_hourly_consumption,
+    import_price,
     get_solar_forecast,
     get_scheduled_plan_state,
     load_env_file,
     optimize_day,
-    optimize_night_charge,
     parse_station_status,
     seasonal_daily_consumption,
     sign_sofar_request,
@@ -85,16 +84,20 @@ class OptimizationTests(unittest.TestCase):
             "battery_capacity": {"value": 5},
         }
 
-    def test_four_t_tariff_and_weekend_discount(self):
+    def test_four_t_tariff_bands_include_transit_and_weekend_discount(self):
         monday = datetime(2026, 10, 26)
         saturday = datetime(2026, 10, 24)
 
-        self.assertEqual(electricity_price(monday.replace(hour=2), True), 0.052)
-        self.assertEqual(electricity_price(monday.replace(hour=10), True), 0.061)
-        self.assertEqual(electricity_price(monday.replace(hour=15), True), 0.092)
-        self.assertEqual(electricity_price(monday.replace(hour=7), True), 0.137)
-        self.assertAlmostEqual(electricity_price(saturday.replace(hour=7), True), 0.137 * 0.88)
-        self.assertEqual(electricity_price(monday.replace(hour=2), False), 0.083)
+        self.assertEqual(import_price(monday.replace(hour=2), True), 0.117)
+        self.assertEqual(import_price(monday.replace(hour=10), True), 0.129)
+        self.assertEqual(import_price(monday.replace(hour=15), True), 0.167)
+        self.assertEqual(import_price(monday.replace(hour=18), True), 0.167)
+        self.assertEqual(import_price(monday.replace(hour=7), True), 0.222)
+        self.assertEqual(import_price(monday.replace(hour=20), True), 0.222)
+        self.assertEqual(import_price(monday.replace(hour=2), False), 0.156)
+        self.assertEqual(import_price(monday.replace(hour=15), False), 0.206)
+        self.assertAlmostEqual(import_price(saturday.replace(hour=7), True), 0.222 - 0.12 * (0.222 - 0.052))
+        self.assertAlmostEqual(import_price(saturday.replace(hour=2), True), 0.117 - 0.12 * (0.117 - 0.052))
 
     def test_seasonal_consumption_matches_configured_summer_and_winter(self):
         self.assertAlmostEqual(
@@ -129,68 +132,68 @@ class OptimizationTests(unittest.TestCase):
                                 },
                             },
                             sampled_at,
-                            0.052,
-                            0.083,
+                            0.117,
+                            0.156,
                         )
 
-            plan = optimize_night_charge(
-                self.sample_status(),
+            plan = optimize_day(
+                self.sample_status(40),
                 self.sample_forecast(40),
                 7,
                 6,
                 25,
                 True,
-                now=datetime(2026, 10, 23, 10, tzinfo=ZoneInfo(TIMEZONE)),
+                now=datetime(2026, 10, 24, 0, 0, tzinfo=ZoneInfo(TIMEZONE)),
                 history_store=history,
             )
 
         self.assertEqual(plan["consumption_estimate_source"], "same_weekday_history")
         self.assertEqual(plan["consumption_history_days"], 3)
-        self.assertEqual(plan["estimated_daily_consumption_kwh"], 12)
-        self.assertAlmostEqual(plan["forecast_consumption_kwh"], 12)
+        self.assertEqual(plan["hourly_consumption_profile_source"], "same_weekday_history")
+        self.assertEqual(plan["hourly_consumption_profile_days"], 3)
+        self.assertAlmostEqual(
+            sum(item["consumption_kwh"] for item in plan["hourly_plan"]),
+            12,
+            places=2,
+        )
         hourly_by_time = {
             item["time"][11:13]: item["consumption_kwh"]
             for item in plan["hourly_plan"]
         }
-        self.assertEqual(plan["hourly_consumption_profile_source"], "same_weekday_history")
-        self.assertEqual(plan["hourly_consumption_profile_days"], 3)
         self.assertGreater(hourly_by_time["07"], hourly_by_time["12"])
 
-    def test_cloudy_forecast_recommends_more_night_charge_than_sunny_forecast(self):
+    def test_cloudy_forecast_needs_more_grid_charge_than_sunny_forecast(self):
         now = datetime(2026, 10, 23, 10, tzinfo=ZoneInfo(TIMEZONE))
-        settings = (7, 6, 25, True)
-        cloudy = optimize_night_charge(
+        cloudy = optimize_day(
             self.sample_status(),
             self.sample_forecast(40),
-            *settings,
+            7,
+            6,
+            25,
+            True,
             now=now,
         )
-        sunny = optimize_night_charge(
+        sunny = optimize_day(
             self.sample_status(),
             self.sample_forecast(700),
-            *settings,
+            7,
+            6,
+            25,
+            True,
             now=now,
         )
 
-        self.assertTrue(cloudy["recommended"])
-        self.assertGreater(
-            cloudy["recommended_grid_charge_kwh"],
-            sunny["recommended_grid_charge_kwh"],
-        )
-        self.assertEqual(cloudy["charge_start_date"], "2026-10-24")
-        self.assertEqual(cloudy["charge_start"][11:13], "04")
-        self.assertEqual(cloudy["charge_end"], "2026-10-24T06:00+02:00")
-        self.assertEqual(cloudy["plan_date"], "2026-10-24")
+        def grid_kwh(plan):
+            return sum(window["recommended_grid_charge_kwh"] for window in plan["windows"])
+
+        self.assertGreater(grid_kwh(cloudy), grid_kwh(sunny))
         self.assertEqual(len(cloudy["hourly_plan"]), 24)
-        self.assertEqual(cloudy["hourly_plan"][0]["time"], "2026-10-24T00:00+02:00")
-        self.assertEqual(cloudy["hourly_plan"][-1]["time"], "2026-10-24T23:00+02:00")
+        self.assertGreaterEqual(cloudy["estimated_savings_eur"], 0)
         self.assertAlmostEqual(
             sum(hour["grid_charge_kwh"] for hour in cloudy["hourly_plan"]),
-            cloudy["recommended_grid_charge_kwh"],
-            places=2,
+            grid_kwh(cloudy),
+            delta=0.05,
         )
-        self.assertEqual(cloudy["recommended_target_soc"], 95)
-        self.assertGreaterEqual(cloudy["estimated_savings_eur"], 0)
 
     def test_multi_window_optimizer_includes_next_morning_and_daily_consumption(self):
         start = datetime(2026, 10, 24, tzinfo=timezone.utc)
@@ -295,7 +298,7 @@ class OptimizationTests(unittest.TestCase):
         self.assertTrue(plan["horizon_start"].startswith("2026-01-02T00:00"))
         self.assertEqual(len(plan["hourly_plan"]), 12)
 
-    def test_optimizer_respects_nine_hour_night_during_dst_fallback(self):
+    def test_horizon_across_dst_fallback_keeps_every_real_hour(self):
         start = datetime(2026, 10, 24, tzinfo=timezone.utc)
         forecast = {
             "location": "Jacovce",
@@ -307,29 +310,23 @@ class OptimizationTests(unittest.TestCase):
                 for hour in range(72)
             ],
         }
-        plan = optimize_night_charge(
-            {
-                "metrics": {"battery_soc": 30},
-                "battery_capacity": {"value": 100},
-            },
+        plan = optimize_day(
+            self.sample_status(soc=50),
             forecast,
             7,
-            100,
-            100,
+            24,
+            24,
             True,
-            now=datetime(2026, 10, 24, 10, tzinfo=ZoneInfo(TIMEZONE)),
+            now=datetime(2026, 10, 24, 23, 0, tzinfo=ZoneInfo(TIMEZONE)),
         )
 
-        self.assertGreater(plan["recommended_grid_charge_kwh"], 17.9)
-        self.assertEqual(plan["charge_start"], "2026-10-24T22:00+02:00")
-        self.assertEqual(plan["charge_end"], "2026-10-25T06:00+01:00")
-        self.assertAlmostEqual(
-            plan["forecast_consumption_kwh"],
-            plan["estimated_daily_consumption_kwh"],
-            places=2,
-        )
+        times = [item["time"] for item in plan["hourly_plan"]]
+        self.assertEqual(len(times), 24)
+        self.assertEqual(len(set(times)), 24)
+        self.assertIn("2026-10-25T02:00+02:00", times)
+        self.assertIn("2026-10-25T02:00+01:00", times)
 
-    def test_optimizer_does_not_recommend_charge_when_battery_is_above_target(self):
+    def test_full_battery_does_not_buy_energy_at_peak_prices(self):
         status = {
             "metrics": {"battery_soc": 100},
             "battery_capacity": {"value": 100},
@@ -345,7 +342,7 @@ class OptimizationTests(unittest.TestCase):
                 for hour in range(72)
             ],
         }
-        plan = optimize_night_charge(
+        plan = optimize_day(
             status,
             forecast,
             7,
@@ -355,14 +352,17 @@ class OptimizationTests(unittest.TestCase):
             now=datetime(2026, 10, 23, 22, tzinfo=ZoneInfo(TIMEZONE)),
         )
 
-        self.assertFalse(plan["recommended"])
-        self.assertEqual(plan["recommended_grid_charge_kwh"], 0)
-        self.assertIsNone(plan["recommended_target_soc"])
+        for window in plan["windows"]:
+            self.assertLess(window["average_price_eur_per_kwh"], 0.2, window)
+        self.assertLessEqual(
+            sum(window["recommended_grid_charge_kwh"] for window in plan["windows"]),
+            1,
+        )
 
     def test_optimizer_rejects_incomplete_forecast_and_invalid_settings(self):
         now = datetime(2026, 10, 23, 10, tzinfo=ZoneInfo(TIMEZONE))
         with self.assertRaises(ForecastError):
-            optimize_night_charge(
+            optimize_day(
                 self.sample_status(),
                 {"hourly": []},
                 7,
@@ -432,6 +432,28 @@ class OptimizationTests(unittest.TestCase):
         self.assertEqual(forecast["location"], "Jacovce")
         self.assertEqual(forecast["hourly"][0]["shortwave_radiation"], 125.5)
         self.assertEqual(request.call_count, 2)
+        self.assertNotIn("global_tilted_irradiance", request.call_args_list[1].args[0])
+
+    def test_tilted_forecast_requests_panel_plane_irradiance(self):
+        with patch(
+            "run._open_meteo_json",
+            side_effect=[
+                {"results": [{"name": "Jacovce", "country_code": "SK", "latitude": 48.6, "longitude": 18.2}]},
+                {
+                    "hourly": {
+                        "time": ["2026-10-23T11:00"],
+                        "global_tilted_irradiance": [310.0],
+                    }
+                },
+            ],
+        ) as request:
+            forecast = get_solar_forecast("Jacovce", tilt_deg=35, azimuth_deg=-90)
+
+        url = request.call_args_list[1].args[0]
+        self.assertIn("hourly=global_tilted_irradiance", url)
+        self.assertIn("tilt=35", url)
+        self.assertIn("azimuth=-90", url)
+        self.assertEqual(forecast["hourly"][0]["shortwave_radiation"], 310.0)
 
 
 class ScheduledPlanStateTests(unittest.TestCase):
@@ -808,8 +830,8 @@ class HistoryStoreTests(unittest.TestCase):
         history.record_telemetry.assert_called_once_with(
             client.get_status.return_value,
             sampled_at,
-            0.061,
-            0.092,
+            0.129,
+            0.167,
         )
 
     def test_records_mode_and_estimated_savings_events(self):

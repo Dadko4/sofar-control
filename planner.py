@@ -1,13 +1,18 @@
-"""Pure multi-window charge planner and self-use counterfactual replay."""
+"""Battery dispatch planner: 15-minute dynamic programming and self-use replay."""
 
 import math
 from dataclasses import dataclass
 from datetime import timedelta
 
-CHARGE_STEP_KWH = 0.25
-MIN_WINDOW_GRID_KWH = 0.5
-MIN_IMPROVEMENT_EUR = 0.0005
+SLOT_HOURS = 0.25
+SOC_STEP_KWH = 0.025
+CHARGE_POWER_LEVELS_KW = (0.5, 1.0, 1.5, 2.0)
+DISCHARGE_POWER_LEVELS_KW = (1.0, 2.0)
 MIN_TARGET_SOC = 31
+MAX_CHARGE_POWER_W = 2000
+
+SELF_USE = ("self_use", 0.0)
+HOLD = ("hold", 0.0)
 
 
 @dataclass(frozen=True)
@@ -19,112 +24,152 @@ class BatteryModel:
     discharge_efficiency: float
     max_grid_kw: float = 2.0
     max_soc: int = 95
+    wear_eur_per_kwh: float = 0.0
 
 
-def _step(energy, grid_charge_kwh, solar_kwh, consumption_kwh, battery):
-    """Advance one hour in self-use; returns (energy, soc_after_charge, grid_charge, grid_load)."""
-    room = max(0.0, battery.max_energy_kwh - energy) / battery.charge_efficiency
-    grid_charge = min(max(0.0, grid_charge_kwh), room)
-    energy += grid_charge * battery.charge_efficiency
-    energy_after_charge = energy
-    # The inverter serves the load from the grid only while it is charging.
-    charging_share = min(1.0, grid_charge / battery.max_grid_kw)
-    grid_load = 0.0
-    for share, from_grid in (
-        (charging_share, True),
-        (1.0 - charging_share, False),
-    ):
-        net = (solar_kwh - consumption_kwh) * share
-        if net >= 0:
-            energy = min(
-                battery.max_energy_kwh,
-                energy + net * battery.charge_efficiency,
-            )
-        elif from_grid:
-            grid_load += -net
-        else:
-            deliverable = (
-                max(0.0, energy - battery.min_energy_kwh)
-                * battery.discharge_efficiency
-            )
-            delivered = min(-net, deliverable)
-            energy -= delivered / battery.discharge_efficiency
-            grid_load += -net - delivered
-    return energy, energy_after_charge, grid_charge, grid_load
+def _transition(energy, action, solar_kwh, load_kwh, battery, hours):
+    """Advance one slot. Returns (energy_next, grid_charge, grid_import, export, stored, energy_after_charge).
+
+    Solar surplus charges the battery before it is exported. Self-use covers house
+    deficits from the battery; hold keeps the battery idle; charge pulls from the grid
+    at a fixed power while the inverter serves the load from the grid; discharge sends
+    battery energy to the house or the grid.
+    """
+    kind, power_kw = action
+    room = max(0.0, battery.max_energy_kwh - energy)
+    grid_charge = (
+        min(power_kw * hours, room / battery.charge_efficiency) if kind == "charge" else 0.0
+    )
+    grid_stored = grid_charge * battery.charge_efficiency
+    surplus = max(0.0, solar_kwh - load_kwh)
+    deficit = max(0.0, load_kwh - solar_kwh)
+    solar_stored = min(surplus * battery.charge_efficiency, room - grid_stored)
+    solar_export = surplus - solar_stored / battery.charge_efficiency
+    after_charge = energy + grid_stored + solar_stored
+    deliverable = max(0.0, energy - battery.min_energy_kwh) * battery.discharge_efficiency
+    if kind == "self_use":
+        requested = deficit
+    elif kind == "discharge":
+        requested = power_kw * hours
+    else:
+        requested = 0.0
+    delivered = min(requested, deliverable)
+    energy_next = min(
+        battery.max_energy_kwh,
+        max(battery.min_energy_kwh, after_charge - delivered / battery.discharge_efficiency),
+    )
+    grid_import = grid_charge + max(0.0, deficit - delivered)
+    export = solar_export + max(0.0, delivered - deficit)
+    stored = grid_stored + solar_stored
+    return energy_next, grid_charge, grid_import, export, stored, after_charge
 
 
-def simulate_hours(hours, grid_charge, initial_energy, battery):
+def _actions(battery, allow_hold, allow_discharge):
+    actions = [SELF_USE]
+    if allow_hold:
+        actions.append(HOLD)
+    actions += [
+        ("charge", kw)
+        for kw in CHARGE_POWER_LEVELS_KW
+        if kw <= battery.max_grid_kw + 1e-9
+    ]
+    if allow_discharge:
+        actions += [("discharge", kw) for kw in DISCHARGE_POWER_LEVELS_KW]
+    return actions
+
+
+def _replay(slots, actions, initial_energy, battery, export_price_eur_kwh):
     energy = initial_energy
     rows = []
-    cost = 0.0
-    for hour, requested in zip(hours, grid_charge):
-        energy_start = energy
-        energy, after_charge, charged, grid_load = _step(
+    for slot, action in zip(slots, actions):
+        hours = slot.get("hours", SLOT_HOURS)
+        start_energy = energy
+        energy, grid_charge, grid_import, export, stored, after_charge = _transition(
             energy,
-            requested,
-            hour["solar_kwh"],
-            hour["consumption_kwh"],
+            action,
+            slot["solar_kwh"],
+            slot["consumption_kwh"],
             battery,
+            hours,
         )
-        hour_cost = (charged + grid_load) * hour["price"]
-        cost += hour_cost
         rows.append(
             {
-                "start": hour["start"],
-                "price": hour["price"],
-                "solar_kwh": hour["solar_kwh"],
-                "consumption_kwh": hour["consumption_kwh"],
-                "grid_charge_kwh": charged,
-                "grid_import_kwh": charged + grid_load,
-                "soc_start": energy_start / battery.capacity_kwh * 100,
+                "start": slot["start"],
+                "hours": hours,
+                "price": slot["price"],
+                "action": action[0],
+                "power_kw": action[1],
+                "solar_kwh": slot["solar_kwh"],
+                "consumption_kwh": slot["consumption_kwh"],
+                "grid_charge_kwh": grid_charge,
+                "grid_import_kwh": grid_import,
+                "export_kwh": export,
+                "soc_start": start_energy / battery.capacity_kwh * 100,
                 "soc_after_charge": after_charge / battery.capacity_kwh * 100,
                 "soc_end": energy / battery.capacity_kwh * 100,
-                "cost_eur": hour_cost,
+                "cost_eur": grid_import * slot["price"] - export * export_price_eur_kwh,
+                "wear_eur": stored * battery.wear_eur_per_kwh,
             }
         )
-    return {"cost_eur": cost, "final_energy_kwh": energy, "rows": rows}
+    return {
+        "rows": rows,
+        "final_energy_kwh": energy,
+        "cost_eur": sum(row["cost_eur"] for row in rows),
+        "wear_eur": sum(row["wear_eur"] for row in rows),
+    }
 
 
-def _objective(result, battery, terminal_price):
-    stored = max(0.0, result["final_energy_kwh"] - battery.min_energy_kwh)
-    return result["cost_eur"] - terminal_price * battery.discharge_efficiency * stored
+def _plan_actions(slots, initial_energy, battery, terminal_value, export_price, actions):
+    low = battery.min_energy_kwh
+    high = battery.max_energy_kwh
+    span = high - low
+    count = max(1, round(span / SOC_STEP_KWH))
+    levels = [low + span * index / count for index in range(count + 1)]
 
+    def future(values, energy):
+        position = min(count, max(0.0, (energy - low) / span * count))
+        index = min(count - 1, int(position))
+        fraction = position - index
+        return values[index] * (1 - fraction) + values[index + 1] * fraction
 
-def _greedy_charge(hours, initial_energy, battery, terminal_price):
-    grid_charge = [0.0] * len(hours)
-    caps = [battery.max_grid_kw * hour["fraction"] for hour in hours]
-    current = _objective(
-        simulate_hours(hours, grid_charge, initial_energy, battery),
-        battery,
-        terminal_price,
-    )
-    while True:
+    def choose(energy, slot, next_values):
+        hours = slot.get("hours", SLOT_HOURS)
         best = None
-        best_rate = 0.0
-        for index, cap in enumerate(caps):
-            if grid_charge[index] + 1e-9 >= cap:
-                continue
-            targets = {
-                min(cap, grid_charge[index] + CHARGE_STEP_KWH),
-                cap,
-            }
-            for target in targets:
-                trial = grid_charge[:]
-                trial[index] = target
-                value = _objective(
-                    simulate_hours(hours, trial, initial_energy, battery),
-                    battery,
-                    terminal_price,
-                )
-                gain = current - value
-                rate = gain / (target - grid_charge[index])
-                if gain > MIN_IMPROVEMENT_EUR and rate > best_rate:
-                    best_rate = rate
-                    best = (index, target, value)
-        if best is None:
-            return grid_charge
-        grid_charge[best[0]] = best[1]
-        current = best[2]
+        for action_index, action in enumerate(actions):
+            energy_next, _, grid_import, export, stored, _ = _transition(
+                energy, action, slot["solar_kwh"], slot["consumption_kwh"], battery, hours
+            )
+            total = (
+                grid_import * slot["price"]
+                - export * export_price
+                + battery.wear_eur_per_kwh * stored
+                + future(next_values, energy_next)
+            )
+            if best is None or total < best_total:
+                best_total, best = total, action
+        return best_total, best
+
+    values = [None] * (len(slots) + 1)
+    values[-1] = [-terminal_value * energy for energy in levels]
+    for index in range(len(slots) - 1, -1, -1):
+        values[index] = [
+            choose(energy, slots[index], values[index + 1])[0] for energy in levels
+        ]
+
+    energy = initial_energy
+    chosen = []
+    for index, slot in enumerate(slots):
+        _, action = choose(energy, slot, values[index + 1])
+        chosen.append(action)
+        energy = _transition(
+            energy,
+            action,
+            slot["solar_kwh"],
+            slot["consumption_kwh"],
+            battery,
+            slot.get("hours", SLOT_HOURS),
+        )[0]
+    return chosen
 
 
 def _round_up_minute(moment):
@@ -133,42 +178,32 @@ def _round_up_minute(moment):
     return moment
 
 
-def _build_windows(hours, rows, battery, display_tz=None):
+def _is_charging(row):
+    return row["action"] == "charge" and row["grid_charge_kwh"] > 1e-6
+
+
+def _charge_power_w(power_kw):
+    return min(MAX_CHARGE_POWER_W, max(100, math.ceil(power_kw * 10 - 1e-9) * 100))
+
+
+def _windows(rows, battery, display_tz):
     windows = []
-    count = len(rows)
     index = 0
-    while index < count:
-        if rows[index]["grid_charge_kwh"] <= 1e-6:
+    while index < len(rows):
+        if not _is_charging(rows[index]):
             index += 1
             continue
         last = index
-        while (
-            last + 1 < count
-            and rows[last + 1]["grid_charge_kwh"] > 1e-6
-        ):
+        while last + 1 < len(rows) and _is_charging(rows[last + 1]):
             last += 1
-        first_row, last_row = rows[index], rows[last]
-        total = sum(row["grid_charge_kwh"] for row in rows[index : last + 1])
-        first_begin = hours[index]["begin"]
-        if index == last:
-            start = first_begin
-            end = start + timedelta(
-                hours=first_row["grid_charge_kwh"] / battery.max_grid_kw
-            )
-        else:
-            slot_end = hours[index]["start"] + timedelta(hours=1)
-            start = max(
-                first_begin,
-                slot_end
-                - timedelta(
-                    hours=first_row["grid_charge_kwh"] / battery.max_grid_kw
-                ),
-            )
-            end = hours[last]["start"] + timedelta(
-                hours=last_row["grid_charge_kwh"] / battery.max_grid_kw
-            )
-        start = _round_up_minute(start)
-        end = _round_up_minute(end)
+        chunk = rows[index : last + 1]
+        total = sum(row["grid_charge_kwh"] for row in chunk)
+        duration = sum(row["hours"] for row in chunk)
+        power_w = _charge_power_w(total / duration)
+        start = _round_up_minute(chunk[0]["start"])
+        end = _round_up_minute(
+            chunk[0]["start"] + timedelta(hours=total / (power_w / 1000))
+        )
         if end <= start:
             end = start + timedelta(minutes=1)
         if display_tz is not None:
@@ -176,19 +211,14 @@ def _build_windows(hours, rows, battery, display_tz=None):
             end = end.astimezone(display_tz)
         target_soc = min(
             battery.max_soc,
-            max(MIN_TARGET_SOC, math.ceil(last_row["soc_after_charge"] - 1e-9)),
+            max(MIN_TARGET_SOC, math.ceil(chunk[-1]["soc_after_charge"] - 1e-9)),
         )
-        weighted_price = (
-            sum(
-                row["grid_charge_kwh"] * row["price"]
-                for row in rows[index : last + 1]
-            )
-            / total
-        )
+        weighted_price = sum(row["grid_charge_kwh"] * row["price"] for row in chunk) / total
         windows.append(
             {
                 "charge_start": start.isoformat(timespec="minutes"),
                 "charge_end": end.isoformat(timespec="minutes"),
+                "charge_power_w": power_w,
                 "recommended_target_soc": target_soc,
                 "recommended_grid_charge_kwh": round(total, 2),
                 "average_price_eur_per_kwh": round(weighted_price, 4),
@@ -201,90 +231,176 @@ def _build_windows(hours, rows, battery, display_tz=None):
     return windows
 
 
-def _public_row(row, display_tz=None):
-    moment = row["start"]
-    if display_tz is not None:
-        moment = moment.astimezone(display_tz)
-    return {
-        "time": moment.isoformat(timespec="minutes"),
-        "tariff_eur_per_kwh": round(row["price"], 4),
-        "solar_kwh": round(row["solar_kwh"], 3),
-        "consumption_kwh": round(row["consumption_kwh"], 3),
-        "grid_charge_kwh": round(row["grid_charge_kwh"], 3),
-        "grid_import_kwh": round(row["grid_import_kwh"], 3),
-        "soc_start": round(row["soc_start"], 1),
-        "soc_end": round(row["soc_end"], 1),
-        "cost_eur": round(row["cost_eur"], 4),
-    }
+def _display(moment, display_tz):
+    return moment if display_tz is None else moment.astimezone(display_tz)
 
 
-def optimize_windows(hours, initial_energy, battery, terminal_price, display_tz=None):
-    """Choose grid-charge hours minimising cost; hours need start, begin, fraction,
-    price, solar_kwh and consumption_kwh. Pass hours in UTC so DST changes keep
-    hourly arithmetic correct; display_tz only affects the reported timestamps."""
-    if not hours:
-        raise ValueError("At least one forecast hour is required.")
-    grid_charge = _greedy_charge(hours, initial_energy, battery, terminal_price)
-    rows = simulate_hours(hours, grid_charge, initial_energy, battery)["rows"]
-    windows = _build_windows(hours, rows, battery, display_tz)
-    kept = []
-    final_charge = [0.0] * len(hours)
-    for window in windows:
-        if window["_total"] < MIN_WINDOW_GRID_KWH:
-            continue
-        kept.append(window)
-        for index in range(window["_first"], window["_last"] + 1):
-            final_charge[index] = rows[index]["grid_charge_kwh"]
-    if len(kept) != len(windows):
-        rows = simulate_hours(hours, final_charge, initial_energy, battery)["rows"]
-        windows = _build_windows(hours, rows, battery, display_tz)
-        kept = [w for w in windows if w["_total"] >= MIN_WINDOW_GRID_KWH]
-    plan = simulate_hours(hours, final_charge, initial_energy, battery)
-    baseline = simulate_hours(hours, [0.0] * len(hours), initial_energy, battery)
-    for number, window in enumerate(kept, start=1):
+def _hourly_plan(rows, base_rows, display_tz):
+    groups = {}
+    for row, base in zip(rows, base_rows):
+        key = row["start"].replace(minute=0, second=0, microsecond=0)
+        group = groups.setdefault(
+            key,
+            {"prices": [], "solar": 0.0, "consumption": 0.0, "charge": 0.0,
+             "grid_import": 0.0, "export": 0.0, "cost": 0.0, "base_cost": 0.0,
+             "soc_start": row["soc_start"], "soc_end": row["soc_end"],
+             "base_soc_end": base["soc_end"]},
+        )
+        group["prices"].append(row["price"])
+        group["solar"] += row["solar_kwh"]
+        group["consumption"] += row["consumption_kwh"]
+        group["charge"] += row["grid_charge_kwh"]
+        group["grid_import"] += row["grid_import_kwh"]
+        group["export"] += row["export_kwh"]
+        group["cost"] += row["cost_eur"]
+        group["base_cost"] += base["cost_eur"]
+        group["soc_end"] = row["soc_end"]
+        group["base_soc_end"] = base["soc_end"]
+    return [
+        {
+            "time": _display(key, display_tz).isoformat(timespec="minutes"),
+            "tariff_eur_per_kwh": round(sum(group["prices"]) / len(group["prices"]), 4),
+            "solar_kwh": round(group["solar"], 3),
+            "consumption_kwh": round(group["consumption"], 3),
+            "grid_charge_kwh": round(group["charge"], 3),
+            "grid_import_kwh": round(group["grid_import"], 3),
+            "export_kwh": round(group["export"], 3),
+            "soc_start": round(group["soc_start"], 1),
+            "soc_end": round(group["soc_end"], 1),
+            "cost_eur": round(group["cost"], 4),
+            "cost_self_use_eur": round(group["base_cost"], 4),
+            "soc_self_use_end": round(group["base_soc_end"], 1),
+        }
+        for key, group in groups.items()
+    ]
+
+
+def _slot_plan(rows, display_tz):
+    plan = []
+    for row in rows:
+        moment = row["start"]
+        if display_tz is not None:
+            moment = moment.astimezone(display_tz)
+        charging = _is_charging(row)
+        plan.append(
+            {
+                "time": moment.isoformat(timespec="minutes"),
+                "action": "charge" if charging else "self_use",
+                "charge_power_w": _charge_power_w(row["grid_charge_kwh"] / row["hours"]) if charging else None,
+                "tariff_eur_per_kwh": round(row["price"], 4),
+                "soc_end": round(row["soc_end"], 1),
+            }
+        )
+    return plan
+
+
+def optimize_schedule(
+    slots,
+    initial_energy,
+    battery,
+    terminal_value_eur_per_kwh,
+    *,
+    export_price_eur_kwh=0.0,
+    allow_hold=False,
+    allow_discharge=False,
+    display_tz=None,
+):
+    """Choose battery actions per slot minimising cost over the horizon.
+
+    slots need start (aware UTC datetime), price, solar_kwh and consumption_kwh, and
+    may set hours (default 0.25). terminal_value_eur_per_kwh values the energy left in
+    the battery at the end of the horizon (stored DC kWh). Battery wear is charged per
+    kWh stored and reported separately from the electricity cost.
+    """
+    if not slots:
+        raise ValueError("At least one forecast slot is required.")
+    actions = _actions(battery, allow_hold, allow_discharge)
+    chosen = _plan_actions(
+        slots,
+        initial_energy,
+        battery,
+        terminal_value_eur_per_kwh,
+        export_price_eur_kwh,
+        actions,
+    )
+    plan = _replay(slots, chosen, initial_energy, battery, export_price_eur_kwh)
+    windows = _windows(plan["rows"], battery, display_tz)
+    for number, window in enumerate(windows, start=1):
         window["id"] = f"window_{number}"
         for key in ("_first", "_last", "_total"):
             window.pop(key)
+    baseline = _replay(
+        slots,
+        [SELF_USE] * len(slots),
+        initial_energy,
+        battery,
+        export_price_eur_kwh,
+    )
     stored_delta = plan["final_energy_kwh"] - baseline["final_energy_kwh"]
-    terminal_value = terminal_price * battery.discharge_efficiency * stored_delta
+    cash_savings = baseline["cost_eur"] - plan["cost_eur"]
+    wear_delta = plan["wear_eur"] - baseline["wear_eur"]
     return {
-        "windows": kept,
+        "windows": windows,
         "cost_with_plan_eur": round(plan["cost_eur"], 4),
         "cost_self_use_eur": round(baseline["cost_eur"], 4),
+        "cash_savings_eur": round(cash_savings, 4),
         "stored_energy_delta_kwh": round(stored_delta, 3),
+        "battery_wear_cost_eur": round(wear_delta, 4),
         "estimated_savings_eur": round(
-            baseline["cost_eur"] - plan["cost_eur"] + terminal_value, 4
+            cash_savings
+            + terminal_value_eur_per_kwh * stored_delta
+            - wear_delta,
+            4,
         ),
-        "cash_savings_eur": round(baseline["cost_eur"] - plan["cost_eur"], 4),
-        "hourly_plan": [
-            dict(
-                _public_row(plan_row, display_tz),
-                cost_self_use_eur=round(base_row["cost_eur"], 4),
-                soc_self_use_end=round(base_row["soc_end"], 1),
-            )
-            for plan_row, base_row in zip(plan["rows"], baseline["rows"])
-        ],
+        "hourly_plan": _hourly_plan(plan["rows"], baseline["rows"], display_tz),
+        "slot_plan": _slot_plan(plan["rows"], display_tz),
     }
+
+
+def plan_actions(
+    slots,
+    initial_energy,
+    battery,
+    terminal_value_eur_per_kwh,
+    *,
+    export_price_eur_kwh=0.0,
+    allow_hold=False,
+    allow_discharge=False,
+):
+    return _plan_actions(
+        slots,
+        initial_energy,
+        battery,
+        terminal_value_eur_per_kwh,
+        export_price_eur_kwh,
+        _actions(battery, allow_hold, allow_discharge),
+    )
+
+
+def evaluate_actions(slots, actions, initial_energy, battery, export_price_eur_kwh=0.0):
+    return _replay(slots, actions, initial_energy, battery, export_price_eur_kwh)
 
 
 def replay_self_use(samples, initial_energy, battery):
     """Replay measured load and solar as if the inverter had stayed in self-use.
 
     samples need start, hours, generation_kw, consumption_kw and price.
-    Returns cumulative cost points and the final battery energy."""
+    Returns cumulative cost points and the final battery energy.
+    """
     energy = initial_energy
     cumulative = 0.0
     points = []
     for sample in samples:
         hours = sample["hours"]
-        energy, _, _, grid_load = _step(
+        energy, _, grid_import, _, _, _ = _transition(
             energy,
-            0.0,
+            SELF_USE,
             max(0.0, sample["generation_kw"]) * hours,
             max(0.0, sample["consumption_kw"]) * hours,
             battery,
+            hours,
         )
-        cumulative += grid_load * sample["price"]
+        cumulative += grid_import * sample["price"]
         points.append(
             {
                 "start": sample["start"],

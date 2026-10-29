@@ -27,7 +27,8 @@ from history import HistoryStore
 from continuous_optimizer import ContinuousOptimizationController
 from live_metrics import calculate_live_metrics
 from multi_window_scheduler import MultiWindowScheduler, compare_plan_with_telemetry
-from planner import BatteryModel, optimize_windows
+from planner import SLOT_HOURS, BatteryModel, optimize_schedule
+from tariff import import_price
 
 
 def load_env_file(path):
@@ -100,11 +101,24 @@ BATTERY_DISCHARGE_EFFICIENCY = 0.95
 PV_SYSTEM_EFFICIENCY = 0.8
 MINIMUM_BATTERY_SOC = 30
 MAXIMUM_BATTERY_SOC = 95
+BATTERY_WEAR_EUR_KWH = float(os.environ.get("SOFAR_BATTERY_WEAR_EUR_KWH", "0.01"))
+EXPORT_PRICE_EUR_KWH = float(os.environ.get("SOFAR_EXPORT_PRICE_EUR_KWH", "0"))
+PV_TILT_SETTING = os.environ.get("SOFAR_PV_TILT_DEG", "").strip()
+PV_TILT_DEG = float(PV_TILT_SETTING) if PV_TILT_SETTING else None
+PV_AZIMUTH_DEG = float(os.environ.get("SOFAR_PV_AZIMUTH_DEG", "0"))
 
 if not math.isfinite(BATTERY_CAPACITY_KWH) or BATTERY_CAPACITY_KWH <= 0:
     raise ValueError("SOFAR_BATTERY_CAPACITY_KWH must be a positive number.")
 if not 100 <= MAX_DISCHARGE_POWER_W <= 2500:
     raise ValueError("SOFAR_MAX_DISCHARGE_POWER_W must be between 100 and 2500.")
+if not math.isfinite(BATTERY_WEAR_EUR_KWH) or BATTERY_WEAR_EUR_KWH < 0:
+    raise ValueError("SOFAR_BATTERY_WEAR_EUR_KWH must be zero or positive.")
+if not math.isfinite(EXPORT_PRICE_EUR_KWH) or EXPORT_PRICE_EUR_KWH < 0:
+    raise ValueError("SOFAR_EXPORT_PRICE_EUR_KWH must be zero or positive.")
+if PV_TILT_DEG is not None and not 0 <= PV_TILT_DEG <= 90:
+    raise ValueError("SOFAR_PV_TILT_DEG must be between 0 and 90.")
+if not -180 <= PV_AZIMUTH_DEG <= 180:
+    raise ValueError("SOFAR_PV_AZIMUTH_DEG must be between -180 and 180.")
 
 LOGIN_PATH = "/api/user/auth/he/login"
 STATION_DETAIL_PATH = "/api/device/stationInfo/selectStationDetail"
@@ -284,7 +298,7 @@ def _open_meteo_json(url):
     return result
 
 
-def get_solar_forecast(location):
+def get_solar_forecast(location, tilt_deg=None, azimuth_deg=0):
     if not isinstance(location, str) or not location.strip() or len(location) > 100:
         raise ValueError("Enter a location name up to 100 characters.")
     geocoding_query = urlencode(
@@ -318,21 +332,22 @@ def get_solar_forecast(location):
     if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
         raise ForecastError("Open-Meteo returned invalid location coordinates.")
 
-    forecast_query = urlencode(
-        {
-            "latitude": latitude,
-            "longitude": longitude,
-            "hourly": "shortwave_radiation",
-            "forecast_days": 3,
-            "timezone": "GMT",
-        }
-    )
-    response = _open_meteo_json(f"{OPEN_METEO_FORECAST_URL}?{forecast_query}")
+    variable = "shortwave_radiation" if tilt_deg is None else "global_tilted_irradiance"
+    forecast_params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": variable,
+        "forecast_days": 3,
+        "timezone": "GMT",
+    }
+    if tilt_deg is not None:
+        forecast_params.update({"tilt": tilt_deg, "azimuth": azimuth_deg})
+    response = _open_meteo_json(f"{OPEN_METEO_FORECAST_URL}?{urlencode(forecast_params)}")
     hourly = response.get("hourly")
     if not isinstance(hourly, dict):
         raise ForecastError("Open-Meteo did not return hourly solar data.")
     times = hourly.get("time")
-    radiation = hourly.get("shortwave_radiation")
+    radiation = hourly.get(variable)
     if not isinstance(times, list) or not isinstance(radiation, list) or len(times) != len(radiation):
         raise ForecastError("Open-Meteo returned incomplete hourly solar data.")
     forecast = []
@@ -357,21 +372,6 @@ def get_solar_forecast(location):
         "country": match.get("country") or "Slovensko",
         "hourly": forecast,
     }
-
-
-def electricity_price(hour, energy_aid=True):
-    if not isinstance(hour, datetime):
-        raise ValueError("Tariff hour must be a datetime.")
-    if 22 <= hour.hour or hour.hour < 6:
-        prices = (0.052, 0.083)
-    elif 9 <= hour.hour < 13:
-        prices = (0.061, 0.092)
-    elif 13 <= hour.hour < 19:
-        prices = (0.092, 0.123)
-    else:
-        prices = (0.137, 0.168)
-    price = prices[0] if energy_aid else prices[1]
-    return price * (0.88 if hour.weekday() >= 5 else 1)
 
 
 def seasonal_daily_consumption(target_date, summer_kwh, winter_kwh):
@@ -560,7 +560,7 @@ def validate_optimization_settings(settings):
 
 def calculate_optimization(settings, client, history_store):
     settings = validate_optimization_settings(settings)
-    forecast = get_solar_forecast(settings["location"])
+    forecast = get_solar_forecast(settings["location"], PV_TILT_DEG, PV_AZIMUTH_DEG)
     status = client.get_status()
     history_sync_warning = None
     if history_store is not None:
@@ -648,6 +648,21 @@ def _local_day_profile_total(target_date, hourly_profile, timezone_info):
     return profile_total
 
 
+def _ceil_quarter_hour(moment):
+    moment = moment.astimezone(timezone.utc)
+    floored = moment.replace(minute=moment.minute - moment.minute % 15, second=0, microsecond=0)
+    return floored if floored == moment else floored + timedelta(minutes=15)
+
+
+def _terminal_value_eur_per_kwh(horizon_end_utc, energy_aid):
+    display_timezone = ZoneInfo(TIMEZONE)
+    prices = [
+        import_price((horizon_end_utc + timedelta(hours=hour)).astimezone(display_timezone), energy_aid)
+        for hour in range(24)
+    ]
+    return sum(prices) / len(prices) * BATTERY_DISCHARGE_EFFICIENCY
+
+
 def optimize_day(
     status,
     forecast,
@@ -659,7 +674,7 @@ def optimize_day(
     history_store=None,
     planning_horizon_hours=24,
 ):
-    """Compute charging windows across a rolling horizon."""
+    """Compute charging windows across a rolling horizon in 15-minute slots."""
     
     try:
         pv_capacity_kwp = float(pv_capacity_kwp)
@@ -700,15 +715,11 @@ def optimize_day(
     except ZoneInfoNotFoundError:
         raise ValueError(f"Unknown SOFAR_TIMEZONE: {TIMEZONE}") from None
     
-    current_hour_utc = local_now.astimezone(timezone.utc).replace(
-        minute=0, second=0, microsecond=0
-    )
-    if local_now.minute or local_now.second or local_now.microsecond:
-        current_hour_utc += timedelta(hours=1)
-    
+    start_utc = _ceil_quarter_hour(local_now)
+    hour_start_utc = start_utc.replace(minute=0, second=0, microsecond=0)
     display_timezone = ZoneInfo(TIMEZONE)
-    plan_date = current_hour_utc.astimezone(display_timezone).date()
-    horizon_end_utc = current_hour_utc + timedelta(hours=planning_horizon_hours)
+    plan_date = start_utc.astimezone(display_timezone).date()
+    horizon_end_utc = start_utc + timedelta(hours=planning_horizon_hours)
     horizon_end = horizon_end_utc.astimezone(display_timezone)
     
     forecast_hours = {}
@@ -727,10 +738,10 @@ def optimize_day(
         hour = hour.replace(minute=0, second=0, microsecond=0)
         if not math.isfinite(irradiance) or irradiance < 0:
             raise ForecastError("Hourly solar forecast contains invalid radiation values.")
-        if current_hour_utc <= hour < horizon_end_utc:
+        if hour_start_utc <= hour < horizon_end_utc:
             forecast_hours[hour] = irradiance
     
-    expected_hours = int((horizon_end_utc - current_hour_utc).total_seconds() // 3600)
+    expected_hours = math.ceil((horizon_end_utc - hour_start_utc).total_seconds() / 3600)
     if len(forecast_hours) < expected_hours:
         raise ForecastError("Solar forecast does not cover the next charging cycle.")
     
@@ -773,52 +784,51 @@ def optimize_day(
         max_energy_kwh=capacity * MAXIMUM_BATTERY_SOC / 100,
         charge_efficiency=BATTERY_CHARGE_EFFICIENCY,
         discharge_efficiency=BATTERY_DISCHARGE_EFFICIENCY,
+        wear_eur_per_kwh=BATTERY_WEAR_EUR_KWH,
     )
     
-    hours = []
-    for forecast_hour_utc in sorted(forecast_hours):
-        hour_local = forecast_hour_utc.astimezone(display_timezone)
+    slots = []
+    slot_start = start_utc
+    while slot_start < horizon_end_utc:
+        hour_utc = slot_start.replace(minute=0, second=0, microsecond=0)
+        hour_local = slot_start.astimezone(display_timezone)
         daily_profile = daily_profiles[hour_local.date()]
-        irradiance = forecast_hours[forecast_hour_utc]
-        solar_kwh = irradiance / 1000 * pv_capacity_kwp * PV_SYSTEM_EFFICIENCY
+        irradiance = forecast_hours[hour_utc]
+        solar_kwh = irradiance / 1000 * pv_capacity_kwp * PV_SYSTEM_EFFICIENCY * SLOT_HOURS
         consumption_kwh = (
             daily_profile["hourly_estimate"]["hourly_kwh"][hour_local.hour]
             * daily_profile["scale"]
+            * SLOT_HOURS
         )
-        
-        hour_begin_utc = forecast_hour_utc
-        hour_end_utc = forecast_hour_utc + timedelta(hours=1)
-        hour_begin_local = hour_begin_utc.astimezone(display_timezone)
-        
-        hours.append(
+        slots.append(
             {
-                "start": forecast_hour_utc,
-                "begin": hour_begin_local,
-                "fraction": 1.0,
-                "price": electricity_price(hour_local, energy_aid),
+                "start": slot_start,
+                "hours": SLOT_HOURS,
+                "price": import_price(hour_local, energy_aid),
                 "solar_kwh": solar_kwh,
                 "consumption_kwh": consumption_kwh,
             }
         )
+        slot_start += timedelta(minutes=15)
     
-    if not hours:
+    if not slots:
         raise ForecastError("No forecast hours found for the planning horizon.")
     
-    terminal_price = electricity_price(horizon_end, energy_aid)
-    
-    result = optimize_windows(
-        hours,
+    terminal_value = _terminal_value_eur_per_kwh(horizon_end_utc, energy_aid)
+    result = optimize_schedule(
+        slots,
         initial_energy_kwh,
         battery,
-        terminal_price,
-        display_tz=ZoneInfo(TIMEZONE),
+        terminal_value,
+        export_price_eur_kwh=EXPORT_PRICE_EUR_KWH,
+        display_tz=display_timezone,
     )
     
     return {
         "location": forecast.get("location") or "",
         "generated_at": local_now.isoformat(timespec="seconds"),
         "plan_date": plan_date.isoformat(),
-        "horizon_start": current_hour_utc.astimezone(display_timezone).isoformat(timespec="minutes"),
+        "horizon_start": start_utc.astimezone(display_timezone).isoformat(timespec="minutes"),
         "horizon_end": horizon_end.isoformat(timespec="minutes"),
         "planning_horizon_hours": planning_horizon_hours,
         "initial_soc": soc,
@@ -830,335 +840,22 @@ def optimize_day(
             "discharge_efficiency": battery.discharge_efficiency,
             "max_grid_kw": battery.max_grid_kw,
             "max_soc": battery.max_soc,
+            "wear_eur_per_kwh": battery.wear_eur_per_kwh,
         },
         "energy_aid": energy_aid,
+        "terminal_value_eur_per_kwh": round(terminal_value, 4),
         "windows": result["windows"],
         "cost_with_plan_eur": result["cost_with_plan_eur"],
         "cost_self_use_eur": result["cost_self_use_eur"],
         "cash_savings_eur": result["cash_savings_eur"],
         "estimated_savings_eur": result["estimated_savings_eur"],
+        "battery_wear_cost_eur": result["battery_wear_cost_eur"],
         "hourly_plan": result["hourly_plan"],
+        "slot_plan": result["slot_plan"],
         "consumption_estimate_source": consumption_estimate["source"],
         "consumption_history_days": consumption_estimate["sample_days"],
         "hourly_consumption_profile_source": hourly_consumption_estimate["source"],
         "hourly_consumption_profile_days": hourly_consumption_estimate["sample_days"],
-    }
-
-
-def optimize_night_charge(
-    status,
-    forecast,
-    pv_capacity_kwp,
-    summer_consumption_kwh,
-    winter_consumption_kwh,
-    energy_aid,
-    now=None,
-    history_store=None,
-):
-    if isinstance(pv_capacity_kwp, bool):
-        raise ValueError("PV capacity must be between 0.1 and 100 kWp.")
-    try:
-        pv_capacity_kwp = float(pv_capacity_kwp)
-        summer_consumption_kwh = float(summer_consumption_kwh)
-        winter_consumption_kwh = float(winter_consumption_kwh)
-        soc = float(status["metrics"]["battery_soc"])
-        capacity = float(status["battery_capacity"]["value"])
-    except (KeyError, TypeError, ValueError):
-        raise ValueError("Valid battery SOC, capacity, PV and consumption values are required.") from None
-    if (
-        not math.isfinite(pv_capacity_kwp)
-        or not 0.1 <= pv_capacity_kwp <= 100
-    ):
-        raise ValueError("PV capacity must be between 0.1 and 100 kWp.")
-    if any(
-        not math.isfinite(value) or not 1 <= value <= 100
-        for value in (summer_consumption_kwh, winter_consumption_kwh)
-    ):
-        raise ValueError("Seasonal consumption must be between 1 and 100 kWh per day.")
-    if not isinstance(energy_aid, bool):
-        raise ValueError("Energy-aid setting must be true or false.")
-    if not math.isfinite(soc) or not 0 <= soc <= 100:
-        raise ValueError("Current battery SOC is invalid.")
-    if not math.isfinite(capacity) or capacity <= 0:
-        raise ValueError("Battery capacity must be positive.")
-    if not isinstance(forecast, dict) or not isinstance(forecast.get("hourly"), list):
-        raise ForecastError("Hourly solar forecast is missing.")
-
-    try:
-        local_now = now or datetime.now(ZoneInfo(TIMEZONE))
-        if local_now.tzinfo is None:
-            local_now = local_now.replace(tzinfo=ZoneInfo(TIMEZONE))
-        local_now = local_now.astimezone(ZoneInfo(TIMEZONE))
-    except ZoneInfoNotFoundError:
-        raise ValueError(f"Unknown SOFAR_TIMEZONE: {TIMEZONE}") from None
-    current_hour = local_now.astimezone(timezone.utc).replace(
-        minute=0, second=0, microsecond=0
-    )
-    if local_now.minute or local_now.second or local_now.microsecond:
-        current_hour += timedelta(hours=1)
-    charge_date = local_now.date() + timedelta(days=1 if local_now.hour >= 22 else 0)
-    charge_deadline = datetime.combine(
-        charge_date + timedelta(days=1),
-        datetime_time(6),
-        tzinfo=ZoneInfo(TIMEZONE),
-    )
-    night_start = datetime.combine(
-        charge_date,
-        datetime_time(22),
-        tzinfo=ZoneInfo(TIMEZONE),
-    )
-    plan_date = charge_deadline.date()
-    consumption_estimate = estimate_daily_consumption(
-        plan_date,
-        summer_consumption_kwh,
-        winter_consumption_kwh,
-        history_store,
-    )
-    hourly_consumption_estimate = estimate_hourly_consumption(
-        plan_date,
-        consumption_estimate["value_kwh"],
-        history_store,
-    )
-    horizon_end = datetime.combine(
-        plan_date + timedelta(days=1),
-        datetime_time(0),
-        tzinfo=ZoneInfo(TIMEZONE),
-    )
-    forecast_hours = {}
-    horizon_end_utc = horizon_end.astimezone(timezone.utc)
-    for item in forecast["hourly"]:
-        if not isinstance(item, dict):
-            raise ForecastError("Hourly solar forecast contains invalid data.")
-        try:
-            hour = datetime.fromisoformat(item["time"])
-            irradiance = float(item["shortwave_radiation"])
-        except (KeyError, TypeError, ValueError):
-            raise ForecastError("Hourly solar forecast contains invalid data.") from None
-        if hour.tzinfo is None:
-            hour = hour.replace(tzinfo=ZoneInfo(TIMEZONE))
-        hour = hour.astimezone(timezone.utc).replace(
-            minute=0, second=0, microsecond=0
-        )
-        if not math.isfinite(irradiance) or irradiance < 0:
-            raise ForecastError("Hourly solar forecast contains invalid radiation values.")
-        if current_hour <= hour < horizon_end_utc:
-            forecast_hours[hour] = irradiance
-    expected_hours = int((horizon_end_utc - current_hour).total_seconds() // 3600)
-    if len(forecast_hours) < expected_hours:
-        raise ForecastError("Solar forecast does not cover the next charging cycle.")
-    plan_date_hours = [
-        hour.astimezone(ZoneInfo(TIMEZONE)).hour
-        for hour in sorted(forecast_hours)
-        if hour.astimezone(ZoneInfo(TIMEZONE)).date() == plan_date
-    ]
-    profile_total_for_day = sum(
-        hourly_consumption_estimate["hourly_kwh"][hour]
-        for hour in plan_date_hours
-    )
-    if profile_total_for_day <= 0:
-        raise ValueError("Hourly consumption estimate must be positive.")
-    daily_profile_scale = consumption_estimate["value_kwh"] / profile_total_for_day
-
-    minimum_energy = capacity * MINIMUM_BATTERY_SOC / 100
-    maximum_energy = capacity * MAXIMUM_BATTERY_SOC / 100
-    initial_energy = min(capacity, max(minimum_energy, capacity * soc / 100))
-
-    def simulate(stored_charge_kwh):
-        energy = initial_energy
-        grid_import_kwh = 0.0
-        energy_cost = 0.0
-        requested_charge = max(0.0, stored_charge_kwh)
-        charge_grid_kwh = 0.0
-        target_soc = None
-        solar_total = 0.0
-        consumption_total = 0.0
-        plan_day_cost = 0.0
-        hourly_plan = []
-        charge_deadline_utc = charge_deadline.astimezone(timezone.utc)
-        requested_grid_charge_kwh = requested_charge / BATTERY_CHARGE_EFFICIENCY
-        requested_start_utc = charge_deadline_utc - timedelta(
-            hours=requested_grid_charge_kwh / 2
-        )
-        for forecast_hour in sorted(forecast_hours):
-            hour = forecast_hour.astimezone(ZoneInfo(TIMEZONE))
-            irradiance = forecast_hours[forecast_hour]
-            solar_kwh = irradiance / 1000 * pv_capacity_kwp * PV_SYSTEM_EFFICIENCY
-            daily_consumption = (
-                consumption_estimate["value_kwh"]
-                if hour.date() == plan_date
-                else seasonal_daily_consumption(
-                    hour.date(),
-                    summer_consumption_kwh,
-                    winter_consumption_kwh,
-                )
-            )
-            consumption_kwh = (
-                hourly_consumption_estimate["hourly_kwh"][hour.hour]
-                * daily_profile_scale
-                if hour.date() == plan_date
-                else daily_consumption / 24
-            )
-            if hour.date() == charge_deadline.date():
-                solar_total += solar_kwh
-                consumption_total += consumption_kwh
-            energy_at_start = energy
-            charge_grid_this_hour = 0.0
-            grid_kwh = 0.0
-            interval_end = forecast_hour + timedelta(hours=1)
-            charging_start = max(forecast_hour, requested_start_utc)
-            charging_end = min(interval_end, charge_deadline_utc)
-            if charging_end > charging_start:
-                hours = (charging_end - charging_start).total_seconds() / 3600
-                remaining_grid_charge = max(
-                    0.0,
-                    requested_grid_charge_kwh - charge_grid_kwh,
-                )
-                available_grid_charge = max(
-                    0.0,
-                    maximum_energy - energy,
-                ) / BATTERY_CHARGE_EFFICIENCY
-                charge_grid_this_hour = min(
-                    2 * hours,
-                    remaining_grid_charge,
-                    available_grid_charge,
-                )
-                stored = charge_grid_this_hour * BATTERY_CHARGE_EFFICIENCY
-                energy += stored
-                charge_grid_kwh += charge_grid_this_hour
-            charge_cost = charge_grid_this_hour * electricity_price(hour, energy_aid)
-            energy_cost += charge_cost
-            grid_cost = 0.0
-            hour_cost = charge_cost
-            if hour.date() == plan_date:
-                plan_day_cost += charge_cost
-            if charge_grid_this_hour > 0:
-                grid_import_kwh += charge_grid_this_hour
-            if interval_end == charge_deadline_utc and charge_grid_kwh > 0:
-                target_soc = min(
-                    MAXIMUM_BATTERY_SOC,
-                    math.ceil(energy / capacity * 100),
-                )
-            net_solar = solar_kwh - consumption_kwh
-            if net_solar >= 0:
-                energy = min(
-                    maximum_energy,
-                    energy + net_solar * BATTERY_CHARGE_EFFICIENCY,
-                )
-            else:
-                demand = -net_solar
-                if charge_grid_this_hour > 0:
-                    grid_kwh = demand
-                else:
-                    deliverable = max(0.0, energy - minimum_energy) * BATTERY_DISCHARGE_EFFICIENCY
-                    battery_delivery = min(demand, deliverable)
-                    energy -= battery_delivery / BATTERY_DISCHARGE_EFFICIENCY
-                    grid_kwh = demand - battery_delivery
-                grid_import_kwh += grid_kwh
-                grid_cost = grid_kwh * electricity_price(hour, energy_aid)
-                energy_cost += grid_cost
-                hour_cost += grid_cost
-                if hour.date() == plan_date:
-                    plan_day_cost += grid_cost
-            if hour.date() == plan_date:
-                hourly_plan.append(
-                    {
-                        "time": hour.isoformat(timespec="minutes"),
-                        "tariff_eur_per_kwh": electricity_price(hour, energy_aid),
-                        "solar_kwh": round(solar_kwh, 3),
-                        "consumption_kwh": round(consumption_kwh, 3),
-                        "grid_charge_kwh": round(charge_grid_this_hour, 3),
-                        "grid_import_kwh": round(
-                            charge_grid_this_hour
-                            + (grid_kwh if net_solar < 0 else 0),
-                            3,
-                        ),
-                        "soc_start": round(energy_at_start / capacity * 100, 1),
-                        "soc_end": round(energy / capacity * 100, 1),
-                        "cost_eur": round(hour_cost, 4),
-                    }
-                )
-        return {
-            "cost_eur": energy_cost,
-            "plan_day_cost_eur": plan_day_cost,
-            "grid_import_kwh": grid_import_kwh,
-            "charge_grid_kwh": charge_grid_kwh,
-            "target_soc": target_soc,
-            "solar_kwh": solar_total,
-            "consumption_kwh": consumption_total,
-            "hourly_plan": hourly_plan,
-        }
-
-    baseline = simulate(0)
-    max_stored = min(
-        maximum_energy - minimum_energy,
-        2
-        * (
-            charge_deadline.astimezone(timezone.utc)
-            - max(
-                night_start.astimezone(timezone.utc),
-                current_hour,
-            )
-        ).total_seconds()
-        / 3600
-        * BATTERY_CHARGE_EFFICIENCY,
-    )
-    candidates = [round(step * 0.05, 2) for step in range(int(max_stored / 0.05) + 1)]
-    results = [(simulate(candidate), candidate) for candidate in candidates]
-    optimized, stored_charge = min(
-        results,
-        key=lambda item: (item[0]["cost_eur"], item[1]),
-    )
-    savings = max(
-        0.0,
-        baseline["plan_day_cost_eur"] - optimized["plan_day_cost_eur"],
-    )
-    schedule_end = charge_deadline
-    schedule_start = (
-        schedule_end.astimezone(timezone.utc)
-        - timedelta(hours=optimized["charge_grid_kwh"] / 2)
-    ).astimezone(ZoneInfo(TIMEZONE))
-    return {
-        "location": forecast.get("location") or "",
-        "generated_at": local_now.isoformat(timespec="seconds"),
-        "charge_start": schedule_start.isoformat(timespec="minutes"),
-        "charge_end": schedule_end.isoformat(timespec="minutes"),
-        "charge_start_date": schedule_start.date().isoformat(),
-        "charge_end_date": schedule_end.date().isoformat(),
-        "plan_date": plan_date.isoformat(),
-        "recommended_target_soc": optimized["target_soc"] if stored_charge else None,
-        "recommended_grid_charge_kwh": round(optimized["charge_grid_kwh"], 2),
-        "estimated_charge_minutes": round(
-            optimized["charge_grid_kwh"] / 2 * 60
-        ),
-        "current_soc": soc,
-        "battery_capacity_kwh": capacity,
-        "pv_capacity_kwp": pv_capacity_kwp,
-        "estimated_daily_consumption_kwh": round(
-            consumption_estimate["value_kwh"],
-            1,
-        ),
-        "consumption_estimate_source": consumption_estimate["source"],
-        "consumption_history_days": consumption_estimate["sample_days"],
-        "hourly_consumption_profile_source": hourly_consumption_estimate["source"],
-        "hourly_consumption_profile_days": hourly_consumption_estimate["sample_days"],
-        "forecast_solar_kwh": round(optimized["solar_kwh"], 2),
-        "forecast_consumption_kwh": round(optimized["consumption_kwh"], 2),
-        "hourly_plan": optimized["hourly_plan"],
-        "estimated_cost_without_grid_charge_eur": round(
-            baseline["plan_day_cost_eur"], 2
-        ),
-        "estimated_cost_with_plan_eur": round(
-            optimized["plan_day_cost_eur"], 2
-        ),
-        "estimated_savings_eur": round(savings, 2),
-        "energy_aid": energy_aid,
-        "recommended": stored_charge > 0.01 and optimized["charge_grid_kwh"] > 0.01,
-        "model_assumptions": [
-            "Denná spotreba vychádza z histórie alebo sezónneho odhadu; hodinový profil sa odhaduje z telemetrie, ak sú dostupné aspoň dva úplné dni, inak sa rozdelí rovnomerne.",
-            "Výroba FVE vychádza z hodinového globálneho žiarenia, výkonu panelov a účinnosti 80 %; sklon a orientácia panelov nie sú zahrnuté.",
-            "Model predpokladá vlastnú spotrebu FVE pred nabíjaním batérie a účinnosť batérie 92 % pri nabíjaní a 95 % pri vybíjaní.",
-            "Odhad nezahŕňa opotrebenie batérie, fixný mesačný poplatok ani ďalšie poplatky a dane.",
-        ],
     }
 
 
@@ -2812,8 +2509,8 @@ class TelemetrySampler:
         self.history_store.record_telemetry(
             status,
             sampled_at,
-            electricity_price(sampled_at, True),
-            electricity_price(sampled_at, False),
+            import_price(sampled_at, True),
+            import_price(sampled_at, False),
         )
 
     def start(self):
@@ -2907,7 +2604,7 @@ def calculate_continuous_session_result(history_store, session, battery_model):
         hourly_plan.append(
             {
                 "time": hour.isoformat(timespec="minutes"),
-                "tariff_eur_per_kwh": electricity_price(
+                "tariff_eur_per_kwh": import_price(
                     local_hour, session["settings"].get("energy_aid", True)
                 ),
             }
@@ -3037,7 +2734,7 @@ def calculate_continuous_results(history_store, days, now=None):
             hourly_plan.append(
                 {
                     "time": hour.isoformat(timespec="minutes"),
-                    "tariff_eur_per_kwh": electricity_price(
+                    "tariff_eur_per_kwh": import_price(
                         local_hour, settings.get("energy_aid", True)
                     ),
                 }
