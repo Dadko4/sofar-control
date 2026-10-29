@@ -1844,6 +1844,45 @@ class DashboardAuthenticationTests(unittest.TestCase):
         handler.send_response.assert_called_once_with(401)
         handler.send_header.assert_any_call("WWW-Authenticate", 'Basic realm="Sofar Opti"')
 
+    def test_only_whitelisted_dashboard_files_are_served(self):
+        from run import WEB_ROOT, DashboardHandler
+
+        for path, name in (("/", "index.html"), ("/app.js", "app.js"), ("/styles.css", "styles.css"), ("/charts.js", "charts.js")):
+            handler = unittest.mock.Mock()
+            handler.path = path
+            DashboardHandler.do_GET(handler)
+            self.assertEqual(handler._send_file.call_args.args[0], WEB_ROOT / name)
+            self.assertTrue((WEB_ROOT / name).is_file(), name)
+        handler = unittest.mock.Mock()
+        handler.path = "/../run.py"
+        DashboardHandler.do_GET(handler)
+        handler._send_file.assert_not_called()
+        handler.send_error.assert_called_once_with(404)
+
+    def test_read_only_mode_rejects_inverter_commands_but_allows_plan_calculation(self):
+        from run import DashboardHandler
+
+        for path, blocked in (("/api/mode", True), ("/api/optimization-plan", True), ("/api/continuous-optimization", True), ("/api/optimization", False)):
+            handler = unittest.mock.Mock()
+            handler.path = path
+            handler.headers.get.return_value = None
+            handler.headers.get_content_type.return_value = "text/plain"
+            with patch("run.READ_ONLY", True):
+                DashboardHandler.do_POST(handler)
+            status = handler._send_json.call_args.args[0]
+            self.assertEqual(status, 403 if blocked else 415, path)
+
+    def test_tariff_endpoint_returns_two_days_of_hourly_prices(self):
+        from run import DashboardHandler
+
+        handler = unittest.mock.Mock()
+        handler.path = "/api/tariff"
+        DashboardHandler.do_GET(handler)
+        status, payload = handler._send_json.call_args.args
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["hours"]), 48)
+        self.assertIn(payload["hours"][0]["band"], {"night", "peak", "late_morning", "afternoon"})
+
     def test_non_loopback_bind_requires_authentication(self):
         from run import main
 

@@ -28,7 +28,7 @@ from continuous_optimizer import ContinuousOptimizationController
 from live_metrics import calculate_live_metrics
 from multi_window_scheduler import MultiWindowScheduler, compare_plan_with_telemetry
 from planner import SLOT_HOURS, BatteryModel, optimize_schedule
-from tariff import import_price
+from tariff import import_price, tariff_schedule
 
 
 def load_env_file(path):
@@ -76,6 +76,7 @@ DISCHARGE_MONITOR_INTERVAL = 10
 ENABLE_PASSIVE_DISCHARGE = os.environ.get(
     "SOFAR_ENABLE_PASSIVE_DISCHARGE", "false"
 ).lower() in {"1", "true", "yes"}
+READ_ONLY = os.environ.get("SOFAR_READ_ONLY", "false").lower() in {"1", "true", "yes"}
 PASSIVE_MODE_COMMAND_MODEL = "HYD 5-20KTL-3PH"
 PASSIVE_DISCHARGE_FIELDS = frozenset({"passiveManualBup", "passiveManualBlo"})
 MODE_CONTROL_LOCK = threading.RLock()
@@ -88,6 +89,12 @@ ALLOWED_ORIGINS = {
     if origin.strip()
 }
 WEB_ROOT = Path(__file__).parent / "web"
+STATIC_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/charts.js": ("charts.js", "text/javascript; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
 DATA_DIR = Path(os.environ.get("SOFAR_DATA_DIR", str(Path(__file__).parent / "data")))
 SCHEDULED_PLAN_FILE = DATA_DIR / "scheduled-plan.json"
 MULTI_WINDOW_STATE_FILE = DATA_DIR / "multi_window_state.json"
@@ -2852,8 +2859,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._is_authorized():
             return
-        if self.path == "/":
-            self._send_file(WEB_ROOT / "index.html", "text/html; charset=utf-8")
+        if self.path in STATIC_FILES:
+            name, content_type = STATIC_FILES[self.path]
+            self._send_file(WEB_ROOT / name, content_type)
+        elif self.path == "/api/tariff":
+            self._send_json(
+                200,
+                {"hours": tariff_schedule(datetime.now(ZoneInfo(TIMEZONE)), 48)},
+            )
         elif self.path == "/api/status":
             self._send_status()
         elif self.path == "/api/capabilities":
@@ -2967,6 +2980,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/continuous-optimization",
         }:
             self.send_error(404)
+            return
+        if READ_ONLY and self.path != "/api/optimization":
+            self._send_json(403, {"error": "Read-only preview: inverter commands are disabled."})
             return
         origin = self.headers.get("Origin")
         if origin and origin not in ALLOWED_ORIGINS and "*" not in ALLOWED_ORIGINS:
@@ -3267,7 +3283,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _send_capabilities(self):
         try:
-            self._send_json(200, CLIENT.get_energy_storage_schema())
+            self._send_json(200, {**CLIENT.get_energy_storage_schema(), "read_only": READ_ONLY})
         except SofarCloudError as error:
             LOGGER.warning("Command schema request failed at %s (API code=%s)", error.stage, error.api_code)
             self._send_json(503, error.as_dict())
@@ -3373,20 +3389,20 @@ def main():
         LOGGER,
     )
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), DashboardHandler)
-    SCHEDULED_CHARGE.start()
-    MULTI_WINDOW_SCHEDULER.start()
-    TELEMETRY_SAMPLER.start()
-    CONTINUOUS_OPTIMIZER.start()
+    workers = (SCHEDULED_CHARGE, MULTI_WINDOW_SCHEDULER, TELEMETRY_SAMPLER, CONTINUOUS_OPTIMIZER)
+    if READ_ONLY:
+        workers = ()
+        LOGGER.warning("Read-only mode: inverter commands and background controllers are disabled.")
+    for worker in workers:
+        worker.start()
     LOGGER.info("Dashboard available at http://%s:%s", WEB_HOST, WEB_PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         LOGGER.info("Shutting down dashboard.")
     finally:
-        SCHEDULED_CHARGE.stop()
-        MULTI_WINDOW_SCHEDULER.stop()
-        TELEMETRY_SAMPLER.stop()
-        CONTINUOUS_OPTIMIZER.stop()
+        for worker in workers:
+            worker.stop()
         server.server_close()
 
 
