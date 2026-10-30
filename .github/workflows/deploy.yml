@@ -1,0 +1,29 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sofar-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build test image
+        run: docker build -t sofar-opti-ci .
+      - name: Run test suite
+        run: >
+          docker run --rm -v "$PWD":/app -w /app --entrypoint python
+          sofar-opti-ci -m unittest discover -p 'test_*.py'
+
+  deploy:
+    needs: test
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Deploy to this host (skips while charging)
+        run: ./scripts/deploy.sh
