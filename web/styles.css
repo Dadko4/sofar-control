@@ -151,6 +151,10 @@ input[type="range"] { width: 100%; }
 .chart-legend-swatch { width: 18px; height: 3px; border-radius: 2px; }
 .chart-legend-swatch.box { height: 10px; width: 14px; border-radius: 3px; }
 .chart-note { margin: 8px 0 0; color: var(--muted); font-size: .82rem; }
+.history-days { display: grid; gap: 14px; max-height: 70vh; overflow-y: auto; margin-top: 10px; padding-right: 4px; }
+.history-day { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: #111d28; }
+.history-day h3 { margin: 0; color: #c5d4de; font-size: 1rem; }
+.history-day p { margin: 4px 0 0; }
 .empty { padding: 18px; border: 1px dashed var(--border); border-radius: 10px; color: var(--muted); text-align: center; }
 
 /* Tariff */

@@ -95,7 +95,7 @@ def terminal_value(day_end_utc, energy_aid, discharge_efficiency=DISCHARGE_EFFIC
         import_price((day_end_utc + timedelta(hours=hour)).astimezone(ZoneInfo(TIMEZONE)), energy_aid)
         for hour in range(24)
     ]
-    return sum(prices) / len(prices) * discharge_efficiency
+    return min(prices) * discharge_efficiency
 
 
 def persistence_slots(day, previous):

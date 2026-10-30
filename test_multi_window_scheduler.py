@@ -2,12 +2,13 @@
 
 import json
 import tempfile
+import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from multi_window_scheduler import MultiWindowScheduler, compare_plan_with_telemetry
+from multi_window_scheduler import MultiWindowScheduler, compare_plan_with_telemetry, window_end_schedule
 
 
 def test_schedule_windows():
@@ -320,6 +321,26 @@ def test_self_use_cost_comparison_uses_only_intervals_with_measured_cost():
     assert actual["hourly"][0]["simulation_cost_eur"] == 0.03
     assert actual["hourly"][0]["self_use_cost_eur"] == 0.05
     assert actual["hourly"][0]["estimated_savings_eur"] == 0.02
+
+
+class WindowEndScheduleTests(unittest.TestCase):
+    def test_device_window_ends_at_planned_end(self):
+        now = datetime(2026, 10, 29, 18, 0, tzinfo=ZoneInfo("Europe/Bratislava"))
+        window = {"charge_start": "2026-10-29T18:00+01:00", "charge_end": "2026-10-29T19:00+01:00"}
+
+        self.assertEqual(window_end_schedule(window, now), {"charge_end_time": "19:00", "charge_end_date": "2026-10-29"})
+
+    def test_window_ending_after_midnight_keeps_next_day(self):
+        now = datetime(2026, 10, 29, 22, 0, tzinfo=ZoneInfo("Europe/Bratislava"))
+        window = {"charge_start": "2026-10-29T22:00+01:00", "charge_end": "2026-10-30T05:30+01:00"}
+
+        self.assertEqual(window_end_schedule(window, now)["charge_end_date"], "2026-10-30")
+
+    def test_falls_back_when_end_is_out_of_range(self):
+        now = datetime(2026, 10, 29, 18, 0, tzinfo=ZoneInfo("Europe/Bratislava"))
+
+        self.assertEqual(window_end_schedule({"charge_end": "2026-11-02T05:00+01:00"}, now), {})
+        self.assertEqual(window_end_schedule({}, now), {})
 
 
 if __name__ == "__main__":

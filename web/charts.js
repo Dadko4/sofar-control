@@ -239,6 +239,125 @@ function renderPlanChart(container, plan, now = new Date()) {
   ]);
 }
 
+function renderHistoryDayChart(container, day, withAid = true) {
+  container.replaceChildren();
+  const hours = (day?.hours || []).filter(hour => Number.isFinite(Date.parse(hour.time)));
+  if (hours.every(hour => hour.pv_kwh === null)) {
+    emptyState(container, "Pre tento deň nie sú merania.");
+    return;
+  }
+  const width = 800;
+  const height = 250;
+  const margin = { top: 22, right: 46, bottom: 30, left: 46 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const start = Date.parse(hours[0].time);
+  const end = Date.parse(hours[hours.length - 1].time) + 3_600_000;
+  const span = Math.max(1, end - start);
+  const x = time => margin.left + (time - start) / span * plotWidth;
+  const energyMax = Math.max(0.5, ...hours.flatMap(hour => [hour.pv_kwh ?? 0, hour.consumption_kwh ?? 0])) * 1.15;
+  const yEnergy = value => margin.top + (1 - value / energyMax) * plotHeight;
+  const ySoc = value => margin.top + (1 - value / 100) * plotHeight;
+  const priceOf = hour => Number(withAid ? hour.tariff_with_aid_eur_per_kwh : hour.tariff_without_aid_eur_per_kwh);
+  const prices = hours.map(priceOf);
+  const minPrice = Math.min(...prices);
+  const maxPrice = Math.max(...prices);
+
+  const svg = svgElement("svg", {
+    class: "chart-svg",
+    viewBox: `0 0 ${width} ${height}`,
+    role: "img",
+    "aria-label": "Výroba, spotreba, tarifa a stav batérie za deň"
+  });
+
+  for (const hour of hours) {
+    const time = Date.parse(hour.time);
+    const band = bandForPrice(priceOf(hour), minPrice, maxPrice);
+    svg.append(svgElement("rect", {
+      x: x(time), y: margin.top, width: Math.max(0, x(time + 3_600_000) - x(time)), height: plotHeight,
+      fill: BAND_COLORS[band], opacity: 0.55
+    }));
+  }
+
+  for (let tick = 0; tick <= 4; tick++) {
+    const position = margin.top + tick / 4 * plotHeight;
+    svg.append(svgElement("line", { x1: margin.left, x2: width - margin.right, y1: position, y2: position, stroke: "#263a4a", "stroke-width": 1 }));
+    svgText(svg, margin.left - 6, position + 4, (energyMax * (1 - tick / 4)).toLocaleString("sk-SK", { maximumFractionDigits: 1 }), "end");
+    svgText(svg, width - margin.right + 6, position + 4, `${100 - tick * 25} %`, "start");
+  }
+  svgText(svg, margin.left - 6, margin.top - 10, "kWh", "end");
+
+  const slot = plotWidth / Math.max(1, hours.length);
+  const barWidth = Math.max(1.5, slot * 0.32);
+  for (const hour of hours) {
+    if (!(hour.grid_charge_kwh > 0.05)) continue;
+    const time = Date.parse(hour.time);
+    const left = x(time);
+    const right = x(time + 3_600_000);
+    svg.append(svgElement("rect", { x: left, y: margin.top - 14, width: right - left, height: 10, rx: 3, fill: "#4fd1c5" }));
+    svg.append(svgElement("rect", { x: left, y: margin.top, width: right - left, height: plotHeight, fill: "#4fd1c5", opacity: 0.12 }));
+  }
+  for (const hour of hours) {
+    if (hour.pv_kwh === null) continue;
+    const center = x(Date.parse(hour.time)) + slot / 2;
+    for (const [field, color, offset] of [["pv_kwh", "#f6c85f", -barWidth], ["consumption_kwh", "#ed6a5a", 0]]) {
+      const value = hour[field];
+      if (value <= 0) continue;
+      svg.append(svgElement("rect", {
+        x: center + offset, y: yEnergy(value), width: barWidth, height: Math.max(0.5, yEnergy(0) - yEnergy(value)),
+        fill: color, opacity: 0.9, rx: 1
+      }));
+    }
+  }
+
+  let path = "";
+  let connected = false;
+  for (const hour of hours) {
+    if (!Number.isFinite(hour.soc_end)) {
+      connected = false;
+      continue;
+    }
+    path += `${connected ? "L" : "M"}${x(Date.parse(hour.time) + 3_600_000).toFixed(1)},${ySoc(hour.soc_end).toFixed(1)} `;
+    connected = true;
+  }
+  if (path) svg.append(svgElement("path", { d: path.trim(), fill: "none", stroke: "#b28dff", "stroke-width": 2.5, "stroke-linejoin": "round" }));
+
+  const labelStep = Math.max(1, Math.ceil(hours.length / 8));
+  hours.forEach((hour, index) => {
+    if (index % labelStep === 0) svgText(svg, x(Date.parse(hour.time)), height - 10, formatClock(new Date(hour.time)));
+  });
+
+  for (const hour of hours) {
+    const time = Date.parse(hour.time);
+    const target = svgElement("rect", {
+      x: x(time), y: margin.top, width: Math.max(0, x(time + 3_600_000) - x(time)), height: plotHeight, fill: "transparent"
+    });
+    const tip = svgElement("title");
+    const lines = [
+      formatClock(new Date(time)),
+      `tarifa ${formatPrice(priceOf(hour))}`,
+      `FVE ${historyNumber(hour.pv_kwh, "kWh")} · spotreba ${historyNumber(hour.consumption_kwh, "kWh")}`,
+      `zo siete ${historyNumber(hour.grid_import_kwh, "kWh")} · do siete ${historyNumber(hour.grid_export_kwh, "kWh")}`,
+      `batéria nabíjanie ${historyNumber(hour.battery_charge_kwh, "kWh")} · vybíjanie ${historyNumber(hour.battery_discharge_kwh, "kWh")}`,
+      `nabíjanie zo siete ${historyNumber(hour.grid_charge_kwh, "kWh")}`,
+      `náklad na odber ${formatEuro(withAid ? hour.cost_with_aid_eur : hour.cost_without_aid_eur, 3)}`
+    ];
+    if (Number.isFinite(hour.soc_end)) lines.push(`SOC na konci ${historyNumber(hour.soc_end, "%")}`);
+    tip.textContent = lines.join("\n");
+    target.append(tip);
+    svg.append(target);
+  }
+
+  container.append(svg);
+  appendLegend(container, [
+    { name: "FVE (kWh)", color: "#f6c85f", box: true },
+    { name: "Spotreba (kWh)", color: "#ed6a5a", box: true },
+    { name: "Batéria SOC (%)", color: "#b28dff" },
+    { name: "Nabíjanie zo siete", color: "#4fd1c5", box: true },
+    ...Object.entries(BAND_NAMES).map(([band, name]) => ({ name, color: BAND_COLORS[band], box: true }))
+  ]);
+}
+
 function renderLineChart(container, datasets, title, unit, options = {}) {
   container.replaceChildren();
   const usable = datasets

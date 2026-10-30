@@ -63,6 +63,17 @@ class OptimizeScheduleTests(unittest.TestCase):
             self.assertTrue(31 <= window["recommended_target_soc"] <= 95)
             self.assertGreater(window["charge_end"], window["charge_start"])
 
+    def test_small_afternoon_arbitrage_is_skipped_by_margin(self):
+        def price(hour):
+            return 0.20 if 19 <= hour < 22 else 0.167
+
+        slots = make_slots(count=96, price=price, load_kwh=0.1)
+        without_margin = optimize_schedule(slots, 1.5, BATTERY, 0.1, display_tz=TZ, grid_charge_margin_eur_kwh=0.0)
+        with_margin = optimize_schedule(slots, 1.5, BATTERY, 0.1, display_tz=TZ)
+
+        self.assertTrue(without_margin["windows"])
+        self.assertEqual(with_margin["windows"], [])
+
     def test_flat_price_never_charges_from_grid(self):
         result = optimize_schedule(
             make_slots(price=lambda hour: 0.1, load_kwh=0.5),

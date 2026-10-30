@@ -20,6 +20,7 @@ COPY run.py .
 COPY continuous_optimizer.py .
 COPY history.py .
 COPY planner.py .
+COPY station_history.py .
 COPY tariff.py .
 COPY multi_window_scheduler.py .
 COPY live_metrics.py .

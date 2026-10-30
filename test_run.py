@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from threading import Event, RLock
 from zoneinfo import ZoneInfo
 
+import run
 from run import (
     TIMEZONE,
     DischargeWatchdog,
@@ -28,6 +29,7 @@ from run import (
     get_solar_forecast,
     get_scheduled_plan_state,
     load_env_file,
+    load_sofar_history,
     optimize_day,
     parse_station_status,
     seasonal_daily_consumption,
@@ -942,6 +944,70 @@ class SofarCloudClientTests(unittest.TestCase):
             args.kwargs["headers"]["sign"],
             sign_sofar_request(args.kwargs["payload"]),
         )
+
+    def test_fetches_multiple_station_series_and_converts_watts(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        client._access_token = "test-token"
+        client._token_expires_at = 9999999999
+        start_time = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        end_time = datetime(2026, 10, 23, tzinfo=timezone.utc)
+        point_time = int(datetime(2026, 10, 22, 8, tzinfo=timezone.utc).timestamp())
+        response = {
+            "code": "0",
+            "data": {
+                "curves": [
+                    {"storageName": "chargePower", "unit": "kW", "detailList": [
+                        {"collectionTime": str(point_time), "value": "-0.5"},
+                    ]},
+                    {"storageName": "gridPower", "unit": "W", "detailList": [
+                        {"collectionTime": str(point_time), "value": "500"},
+                    ]},
+                ]
+            },
+        }
+
+        with patch.object(client, "_request_json", return_value=response) as request:
+            series = client.get_station_series(["chargePower", "gridPower", "generationPower"], start_time, end_time)
+
+        self.assertEqual(request.call_args.kwargs["payload"]["paramList"], ["chargePower", "gridPower", "generationPower"])
+        self.assertEqual(series["chargePower"][0][1], -0.5)
+        self.assertEqual(series["gridPower"][0][1], 0.5)
+        self.assertEqual(series["generationPower"], [])
+
+    def test_consumption_history_still_drops_negative_values(self):
+        client = SofarCloudClient("test@example.com", "test-password", "plant-123")
+        client._access_token = "test-token"
+        client._token_expires_at = 9999999999
+        point_time = int(datetime(2026, 10, 22, 8, tzinfo=timezone.utc).timestamp())
+        response = {"code": "0", "data": {"curves": [{"storageName": "usePower", "unit": "kW", "detailList": [
+            {"collectionTime": str(point_time), "value": -0.3},
+            {"collectionTime": str(point_time + 300), "value": 0.7},
+        ]}]}}
+
+        with patch.object(client, "_request_json", return_value=response):
+            points = client.get_consumption_history(datetime(2026, 10, 22, tzinfo=timezone.utc), datetime(2026, 10, 23, tzinfo=timezone.utc))
+
+        self.assertEqual([value for _, value in points], [0.7])
+
+    def test_sofar_history_is_cached_for_fifteen_minutes(self):
+        now = datetime(2026, 10, 30, 12, 30, tzinfo=ZoneInfo(TIMEZONE))
+        client = MagicMock()
+        client.get_station_series.return_value = {name: [] for name in ("generationPower", "usePower", "gridPower", "chargePower")}
+        cache = {"loaded_at": None, "days": None, "payload": None}
+
+        with patch.dict(run._SOFAR_HISTORY_CACHE, cache):
+            first = load_sofar_history(client, None, 7, now=now)
+            again = load_sofar_history(client, None, 7, now=now + timedelta(minutes=5))
+            self.assertIs(first, again)
+            self.assertEqual(client.get_station_series.call_count, 1)
+            load_sofar_history(client, None, 7, now=now + timedelta(minutes=20))
+            self.assertEqual(client.get_station_series.call_count, 2)
+
+        requested_start = client.get_station_series.call_args.args[1]
+        self.assertEqual((now.date() - requested_start.date()).days, 6)
+        self.assertEqual(requested_start.hour, 0)
+        self.assertEqual(len(first["days"]), 7)
+        self.assertEqual(first["soc_source"], "local_telemetry")
 
     def test_status_maps_station_realtime_values(self):
         result = parse_station_status(

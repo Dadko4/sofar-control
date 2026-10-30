@@ -10,6 +10,7 @@ CHARGE_POWER_LEVELS_KW = (0.5, 1.0, 1.5, 2.0)
 DISCHARGE_POWER_LEVELS_KW = (1.0, 2.0)
 MIN_TARGET_SOC = 31
 MAX_CHARGE_POWER_W = 2000
+GRID_CHARGE_MARGIN_EUR_PER_KWH = 0.03
 
 SELF_USE = ("self_use", 0.0)
 HOLD = ("hold", 0.0)
@@ -119,7 +120,7 @@ def _replay(slots, actions, initial_energy, battery, export_price_eur_kwh):
     }
 
 
-def _plan_actions(slots, initial_energy, battery, terminal_value, export_price, actions):
+def _plan_actions(slots, initial_energy, battery, terminal_value, export_price, actions, grid_margin):
     low = battery.min_energy_kwh
     high = battery.max_energy_kwh
     span = high - low
@@ -136,13 +137,14 @@ def _plan_actions(slots, initial_energy, battery, terminal_value, export_price, 
         hours = slot.get("hours", SLOT_HOURS)
         best = None
         for action_index, action in enumerate(actions):
-            energy_next, _, grid_import, export, stored, _ = _transition(
+            energy_next, grid_charge, grid_import, export, stored, _ = _transition(
                 energy, action, slot["solar_kwh"], slot["consumption_kwh"], battery, hours
             )
             total = (
                 grid_import * slot["price"]
                 - export * export_price
                 + battery.wear_eur_per_kwh * stored
+                + grid_margin * grid_charge
                 + future(next_values, energy_next)
             )
             if best is None or total < best_total:
@@ -304,6 +306,7 @@ def optimize_schedule(
     allow_hold=False,
     allow_discharge=False,
     display_tz=None,
+    grid_charge_margin_eur_kwh=GRID_CHARGE_MARGIN_EUR_PER_KWH,
 ):
     """Choose battery actions per slot minimising cost over the horizon.
 
@@ -322,6 +325,7 @@ def optimize_schedule(
         terminal_value_eur_per_kwh,
         export_price_eur_kwh,
         actions,
+        grid_charge_margin_eur_kwh,
     )
     plan = _replay(slots, chosen, initial_energy, battery, export_price_eur_kwh)
     windows = _windows(plan["rows"], battery, display_tz)
@@ -366,6 +370,7 @@ def plan_actions(
     export_price_eur_kwh=0.0,
     allow_hold=False,
     allow_discharge=False,
+    grid_charge_margin_eur_kwh=GRID_CHARGE_MARGIN_EUR_PER_KWH,
 ):
     return _plan_actions(
         slots,
@@ -374,6 +379,7 @@ def plan_actions(
         terminal_value_eur_per_kwh,
         export_price_eur_kwh,
         _actions(battery, allow_hold, allow_discharge),
+        grid_charge_margin_eur_kwh,
     )
 
 

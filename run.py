@@ -28,6 +28,7 @@ from continuous_optimizer import ContinuousOptimizationController
 from live_metrics import calculate_live_metrics
 from multi_window_scheduler import MultiWindowScheduler, compare_plan_with_telemetry
 from planner import SLOT_HOURS, BatteryModel, optimize_schedule
+from station_history import build_daily_history
 from tariff import import_price, tariff_schedule
 
 
@@ -565,6 +566,46 @@ def validate_optimization_settings(settings):
     }
 
 
+SOFAR_HISTORY_PARAMS = ["generationPower", "usePower", "gridPower", "chargePower"]
+SOFAR_HISTORY_CACHE_SECONDS = 900
+_SOFAR_HISTORY_CACHE = {"loaded_at": None, "days": None, "payload": None}
+_SOFAR_HISTORY_LOCK = threading.Lock()
+
+
+def load_sofar_history(client, history_store, days=7, now=None):
+    now = now or datetime.now(timezone.utc)
+    with _SOFAR_HISTORY_LOCK:
+        cache = _SOFAR_HISTORY_CACHE
+        if (
+            cache["payload"] is not None
+            and cache["days"] == days
+            and (now - cache["loaded_at"]).total_seconds() < SOFAR_HISTORY_CACHE_SECONDS
+        ):
+            return cache["payload"]
+        start = (now.astimezone(ZoneInfo(TIMEZONE)) - timedelta(days=days - 1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        series = client.get_station_series(SOFAR_HISTORY_PARAMS, start, now)
+        soc_samples = []
+        if history_store is not None:
+            soc_samples = [
+                (datetime.fromisoformat(row["sampled_at"]), row["battery_soc"])
+                for row in history_store.telemetry_chart_period(
+                    start.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")
+                )
+                if row.get("battery_soc") is not None
+            ]
+        payload = {
+            "source": "sofarcloud",
+            "soc_source": "local_telemetry",
+            "timezone": TIMEZONE,
+            "generated_at": now.isoformat(timespec="seconds"),
+            "days": build_daily_history(series, TIMEZONE, now, soc_samples, days),
+        }
+        cache.update(loaded_at=now, days=days, payload=payload)
+        return payload
+
+
 def calculate_optimization(settings, client, history_store):
     settings = validate_optimization_settings(settings)
     forecast = get_solar_forecast(settings["location"], PV_TILT_DEG, PV_AZIMUTH_DEG)
@@ -667,7 +708,7 @@ def _terminal_value_eur_per_kwh(horizon_end_utc, energy_aid):
         import_price((horizon_end_utc + timedelta(hours=hour)).astimezone(display_timezone), energy_aid)
         for hour in range(24)
     ]
-    return sum(prices) / len(prices) * BATTERY_DISCHARGE_EFFICIENCY
+    return min(prices) * BATTERY_DISCHARGE_EFFICIENCY
 
 
 def optimize_day(
@@ -1152,6 +1193,13 @@ class SofarCloudClient:
         return parse_station_status(response["data"], self.model)
 
     def get_consumption_history(self, start_time, end_time):
+        return [
+            (timestamp, power_kw)
+            for timestamp, power_kw in self.get_station_series(["usePower"], start_time, end_time)["usePower"]
+            if power_kw >= 0
+        ]
+
+    def get_station_series(self, param_list, start_time, end_time):
         if not self.plant_id:
             raise SofarCloudError(
                 "Set SOFAR_PLANT_ID before requesting historical values.",
@@ -1169,7 +1217,7 @@ class SofarCloudClient:
         payload = {
             "queryType": 1,
             "stationId": self.plant_id,
-            "paramList": ["usePower"],
+            "paramList": list(param_list),
             "startTime": int(start_time.timestamp()),
             "endTime": int(end_time.timestamp()),
         }
@@ -1193,7 +1241,7 @@ class SofarCloudClient:
         )
         if str(response.get("code")) != "0":
             raise SofarCloudError(
-                "SofarCloud could not return historical consumption data.",
+                "SofarCloud could not return historical station data.",
                 "station history",
                 api_code=response.get("code"),
             )
@@ -1205,52 +1253,56 @@ class SofarCloudClient:
                 "station history",
                 api_code=response.get("code"),
             )
-        curve = next(
-            (
-                item
-                for item in curves
-                if isinstance(item, dict) and item.get("storageName") == "usePower"
-            ),
-            None,
-        )
-        if curve is None:
-            return []
-        points = curve.get("detailList")
-        if not isinstance(points, list):
-            raise SofarCloudError(
-                "SofarCloud returned an invalid historical consumption series.",
-                "station history",
-                api_code=response.get("code"),
-            )
-        unit = str(curve.get("unit") or "").strip().lower()
-        if unit not in {"kw", "w"}:
-            raise SofarCloudError(
-                "SofarCloud returned an unsupported historical power unit.",
-                "station history",
-                api_code=response.get("code"),
-            )
-        parsed_points = []
-        for point in points:
-            if not isinstance(point, dict):
-                continue
-            try:
-                timestamp = int(point["collectionTime"])
-                power_kw = float(point["value"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if not math.isfinite(power_kw) or power_kw < 0:
-                continue
-            if unit == "w":
-                power_kw /= 1000
-            parsed_points.append(
+        series = {}
+        for name in param_list:
+            curve = next(
                 (
-                    datetime.fromtimestamp(timestamp, timezone.utc).astimezone(
-                        ZoneInfo(TIMEZONE)
-                    ),
-                    power_kw,
-                )
+                    item
+                    for item in curves
+                    if isinstance(item, dict) and item.get("storageName") == name
+                ),
+                None,
             )
-        return parsed_points
+            if curve is None:
+                series[name] = []
+                continue
+            points = curve.get("detailList")
+            if not isinstance(points, list):
+                raise SofarCloudError(
+                    f"SofarCloud returned an invalid historical series for {name}.",
+                    "station history",
+                    api_code=response.get("code"),
+                )
+            unit = str(curve.get("unit") or "").strip().lower()
+            if unit not in {"kw", "w"}:
+                raise SofarCloudError(
+                    "SofarCloud returned an unsupported historical power unit.",
+                    "station history",
+                    api_code=response.get("code"),
+                )
+            parsed_points = []
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    timestamp = int(point["collectionTime"])
+                    value_kw = float(point["value"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not math.isfinite(value_kw):
+                    continue
+                if unit == "w":
+                    value_kw /= 1000
+                parsed_points.append(
+                    (
+                        datetime.fromtimestamp(timestamp, timezone.utc).astimezone(
+                            ZoneInfo(TIMEZONE)
+                        ),
+                        value_kw,
+                    )
+                )
+            series[name] = parsed_points
+        return series
 
     def _web_headers(self, payload):
         token = self._access_token
@@ -2910,6 +2962,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except sqlite3.Error as error:
                 LOGGER.exception("Could not load telemetry chart data: %s", error)
                 self._send_json(503, {"error": "Could not load telemetry chart data."})
+        elif urlsplit(self.path).path == "/api/sofar-history":
+            raw_days = parse_qs(urlsplit(self.path).query).get("days", ["7"])[0]
+            if not raw_days.isdigit() or not 1 <= int(raw_days) <= 14:
+                self._send_json(400, {"error": "Sofar history period must be between 1 and 14 days."})
+                return
+            try:
+                self._send_json(200, load_sofar_history(CLIENT, HISTORY_STORE, int(raw_days)))
+            except SofarCloudError as error:
+                LOGGER.warning("Sofar history request failed at %s (API code=%s)", error.stage, error.api_code)
+                self._send_json(503, error.as_dict())
         elif urlsplit(self.path).path == "/api/continuous-results":
             if HISTORY_STORE is None:
                 self._send_json(503, {"error": "History logging is not initialized."})

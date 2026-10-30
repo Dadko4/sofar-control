@@ -19,6 +19,16 @@ from zoneinfo import ZoneInfo
 
 from planner import BatteryModel, replay_self_use
 
+
+def window_end_schedule(window, now):
+    try:
+        end = datetime.fromisoformat(window["charge_end"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+    if end.date() - now.date() > timedelta(days=1):
+        return {}
+    return {"charge_end_time": end.strftime("%H:%M"), "charge_end_date": end.date().isoformat()}
+
 LOGGER = None  # Will be set by run.py
 
 
@@ -624,6 +634,7 @@ class MultiWindowScheduler:
                         power_w,
                         confirmed=True,
                         target_soc=target_soc,
+                        **window_end_schedule(window, datetime.now(ZoneInfo(self.timezone_str))),
                     )
                 LOGGER.info(f"Window charging started: {power_w} W, target SOC {target_soc}%")
                 return

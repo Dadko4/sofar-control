@@ -1100,45 +1100,46 @@ async function refreshHistory() {
   }
 }
 
-function renderPowerFlowChart(samples) {
-  const chart = $("power-flow-chart");
-  chart.hidden = false;
-  const series = [
-    ["generation_kw", "Výroba FVE", "#f6c85f"],
-    ["consumption_kw", "Spotreba domu", "#ed6a5a"],
-    ["grid_kw", "Sieť (+ dodávka, − odber)", "#5dade2"],
-    ["battery_charge_kw", "Nabíjanie batérie", "#55c596"],
-    ["battery_discharge_kw", "Vybíjanie batérie (−)", "#b28dff"]
-  ];
-  renderLineChart(
-    chart,
-    series.map(([field, name, color]) => ({
-      name,
-      color,
-      points: samples.map(sample => ({
-        time: sample.sampled_at,
-        value: field === "battery_discharge_kw" && Number.isFinite(sample[field]) ? -Math.abs(sample[field]) : sample[field]
-      }))
-    })),
-    "Výkonové toky za posledných 24 hodín",
-    "kW"
-  );
-  const note = document.createElement("p");
-  note.className = "chart-note";
-  note.textContent = "Pri výpadku telemetrie sa chýbajúce merania nespájajú čiarou.";
-  chart.append(note);
+let sofarHistory = null;
+
+function sofarDayLabel(isoDate) {
+  const label = new Date(`${isoDate}T12:00:00`).toLocaleDateString("sk-SK", { weekday: "long", day: "numeric", month: "long" });
+  const today = new Date();
+  const isToday = isoDate === `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  return isToday ? `${label} (dnes)` : label;
 }
 
-async function refreshPowerChart() {
-  const status = $("power-flow-status");
+function renderSofarHistory() {
+  const container = $("sofar-history-days");
+  container.replaceChildren();
+  const aid = energyAid();
+  for (const day of [...(sofarHistory?.days || [])].reverse()) {
+    const totals = day.totals;
+    const article = document.createElement("article");
+    article.className = "history-day";
+    const heading = document.createElement("h3");
+    heading.textContent = sofarDayLabel(day.date);
+    const summary = document.createElement("p");
+    summary.className = "muted small";
+    summary.textContent = `FVE ${historyNumber(totals.pv_kwh, "kWh")} · spotreba ${historyNumber(totals.consumption_kwh, "kWh")} · zo siete ${historyNumber(totals.grid_import_kwh, "kWh")} (${formatEuro(aid ? totals.cost_with_aid_eur : totals.cost_without_aid_eur)}), z toho nabíjanie batérie ${historyNumber(totals.grid_charge_kwh, "kWh")} · do siete ${historyNumber(totals.grid_export_kwh, "kWh")} · batéria +${historyNumber(totals.battery_charge_kwh, "kWh")} / −${historyNumber(totals.battery_discharge_kwh, "kWh")}`;
+    const chart = document.createElement("div");
+    chart.className = "chart-box";
+    article.append(heading, summary, chart);
+    container.append(article);
+    renderHistoryDayChart(chart, day, aid);
+  }
+  if (!sofarHistory?.days?.length) emptyState(container, "Zatiaľ nie sú dáta za posledných 7 dní.");
+}
+
+async function refreshSofarHistory() {
+  const status = $("sofar-history-status");
   try {
-    const data = await fetchJson("/api/telemetry?hours=24");
-    const samples = data.samples || [];
-    renderPowerFlowChart(samples);
+    sofarHistory = await fetchJson("/api/sofar-history?days=7");
+    renderSofarHistory();
     status.classList.remove("error");
-    status.textContent = samples.length ? `${samples.length} meraní` : "Zatiaľ bez meraní";
+    status.textContent = `SofarCloud · aktualizované ${formatClock(new Date(sofarHistory.generated_at))} · SOC len z lokálnych meraní`;
   } catch (error) {
-    status.textContent = `Graf sa nedá načítať: ${error.message}`;
+    status.textContent = `Históriu sa nepodarilo načítať: ${error.message}`;
     status.classList.add("error");
   }
 }
@@ -1161,10 +1162,10 @@ $("refresh").addEventListener("click", () => {
   refresh();
   refreshScheduledPlan();
   refreshContinuousOptimization();
-  refreshPowerChart();
+  refreshSofarHistory();
   refreshHistory();
 });
-$("refresh-history").addEventListener("click", refreshHistory);
+$("refresh-history").addEventListener("click", () => Promise.all([refreshHistory(), refreshSofarHistory()]));
 $("apply-mode").addEventListener("click", applyMode);
 $("calculate-optimization").addEventListener("click", calculateOptimization);
 $("apply-optimization").addEventListener("click", applyOptimization);
@@ -1174,7 +1175,10 @@ for (const id of ["optimization-location", "optimization-pv", "optimization-summ
   $(id).addEventListener("input", invalidateOptimizationPlan);
   $(id).addEventListener("change", invalidateOptimizationPlan);
 }
-$("optimization-aid").addEventListener("change", updateNowCard);
+$("optimization-aid").addEventListener("change", () => {
+  updateNowCard();
+  renderSofarHistory();
+});
 
 setTab(location.hash.slice(1), false);
 loadOptimizationSettings();
@@ -1184,12 +1188,12 @@ refreshTariff();
 refreshScheduledPlan();
 refreshContinuousOptimization();
 refreshHistory();
-refreshPowerChart();
+refreshSofarHistory();
 window.setInterval(refresh, 60_000);
 window.setInterval(refreshScheduledPlan, 10_000);
 window.setInterval(refreshDischargeStatus, 10_000);
 window.setInterval(refreshContinuousOptimization, 60_000);
 window.setInterval(refreshHistory, 60_000);
-window.setInterval(refreshPowerChart, 300_000);
+window.setInterval(refreshSofarHistory, 900_000);
 window.setInterval(refreshTariff, 900_000);
 window.setInterval(updateNowCard, 30_000);
