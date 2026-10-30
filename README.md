@@ -80,6 +80,50 @@ nabíjaní appka zachová čas ukončenia. Ručné prepnutie do Self-use zruší
 plán; iné ručné režimy sa počas neho odmietnu. Ak návrat do Self-use zlyhá,
 appka opakuje pokus a v rozhraní ukazuje stav.
 
+### Naučená predpoveď výroby a spotreby
+
+Model sa učí z vlastnej histórie elektrárne a z archívu predpovedí Open-Meteo, takže
+sklon, azimut ani tieň sa nemusia zadávať ručne. Pri štarte a potom raz za 7 dní sa
+natrénuje zo SofarCloud hodinových meraní výroby a spotreby a uloží do
+`data/forecast_model.json`. Stav a čas ďalšieho tréningu je v `GET /api/forecast-model`.
+
+- **Výroba FVE:** pomer nameranej výroby a žiarenia sa učí zvlášť pre každú polohu
+  slnka (výška a smer) a pre jasné a oblačné hodiny. Tieň, orientácia a veľkosť
+  systému sa tak zachytia z dát. Riedke polohy sa vyrovnávajú k celkovému pomeru.
+- **Spotreba:** denná spotreba je lineárny model podľa typu dňa (pracovný deň,
+  sobota, nedeľa) a stupňových dní kúrenia a chladenia; základy teplôt sa tiež učia
+  z dát. Hodinový profil je medián posledných šiestich týždňov a úroveň sa prispôsobuje
+  posledným 14 dňom.
+- **Režim** `SOFAR_FORECAST_MODEL_MODE`: `active` (predvolené) plánuje s modelom;
+  `shadow` ukladá predpovede modelu do každého plánu, ale plánuje so vzorcom; `off`
+  model nepoužíva. Ak model chýba alebo sa nedá vypočítať, plán sa vráti k vzorcu.
+
+Výsledky na skúšobnej elektrárni Jacovce: 8 133 meraných hodín od 22. 11. 2025.
+Posledných 28 dní (3. 10.–30. 10. 2026) sa nepoužilo na tréning a slúžilo na test.
+Predpovede počasia sú archivované, nie skutočné namerané počasie.
+
+| Metrika | Vzorec | Model |
+|---|---|---|
+| Výroba FVE, hodinová MAE | 0,268 kWh | **0,157 kWh** |
+| Výroba FVE, denná MAE | 2,83 kWh | **2,40 kWh (−15 %)** |
+| Výroba FVE, denný posun | −1,96 kWh | −0,98 kWh |
+| Spotreba, denná MAE | 2,29 kWh | **2,10 kWh (−8 %)** |
+| Spotreba, denný posun | −1,85 kWh | +0,71 kWh |
+| Spotreba, hodinová MAE | 0,249 kWh | 0,271 kWh |
+
+Vzorec je v tabuľke v pôvodnej podobe, s hodinovým posunom žiarenia. Po jeho oprave
+je hodinová MAE výroby vzorca 0,176 kWh, model je stále lepší. Spotreba je lepšia
+v dennom súčte, hodinový tvar je o niečo horší, preto pri plánovaní sleduje hlavne
+energiu za deň.
+
+Naučené parametre spotreby k 30. 10. 2026: pracovný deň 6,8 kWh, sobota 7,4 kWh,
+nedeľa 6,3 kWh; kúrenie 0,75 kWh na stupeň pod 15 °C; chladenie 0,52 kWh na stupeň
+nad 24 °C.
+
+Obmedzenia: test pokrýva len jeden mesiac (október), sviatky a sneh model nepozná
+a výsledky sa zlepšia s dlhšou históriou. Tréning spusti v Dockeri so `.env`:
+`docker run --rm --env-file .env -v "$PWD":/app -w /app --entrypoint python sofar-control-sofar-opti train_forecast.py --location Jacovce --output /tmp/forecast_model.json`.
+
 ### História a namerané údaje
 
 Aplikácia ukladá zmeny a potvrdenia režimu meniča, zlyhané povely, vypočítané
@@ -117,9 +161,10 @@ sezónny odhad. Denná spotreba sa rozdelí podľa historického hodinového pro
 dostupné aspoň dva úplné dni s dostatkom vzoriek (aspoň 6 v každej hodine a
 aspoň 18 pokrytých hodín za deň). Profil vychádza z priemerného výkonu domu
 SofarCloud `use_power` v každej hodine a upraví sa tak, aby jeho súčet zodpovedal
-dennému odhadu. Inak sa spotreba rozdelí rovnomerne. Predpoveď žiarenia určuje
-odhad výroby FVE; korekcia spotreby podľa predpovedanej teploty sa zatiaľ
-nepoužíva. Ak je nastavený `SOFAR_PV_TILT_DEG`, žiarenie sa berie na naklonenú
+dennému odhadu. Inak sa spotreba rozdelí rovnomerne. Ak je dostupný naučený model
+(režim `active`, pozri nižšie), výroba a spotreba sa berú z neho. Inak predpoveď
+žiarenia určuje odhad výroby FVE a spotreba sa odhaduje vyššie uvedeným spôsobom.
+Ak je nastavený `SOFAR_PV_TILT_DEG`, žiarenie sa berie na naklonenú
 plochu (Open-Meteo GTI) s azimutom `SOFAR_PV_AZIMUTH_DEG` (0 = juh, −90 = východ,
 90 = západ); inak sa používa horizontálne globálne žiarenie. Exportné výnosy sú
 predvolene 0 (`SOFAR_EXPORT_PRICE_EUR_KWH`). Denné riadenie vybíjania alebo
