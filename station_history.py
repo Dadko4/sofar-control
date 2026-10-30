@@ -51,6 +51,11 @@ def _hour_energy(timeline):
     return hours
 
 
+def hourly_energy(series):
+    """UTC hour start -> summed energy buckets for merged 5-minute power series."""
+    return _hour_energy(_timeline(series))
+
+
 def build_daily_history(series, tz_name, now, soc_samples=(), days=7):
     """Local-day hourly energy summaries from SofarCloud 5-minute power series.
 

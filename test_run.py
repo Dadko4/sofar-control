@@ -164,6 +164,36 @@ class OptimizationTests(unittest.TestCase):
         }
         self.assertGreater(hourly_by_time["07"], hourly_by_time["12"])
 
+    def test_radiation_labelled_at_hour_end_feeds_the_preceding_hour(self):
+        start = datetime(2026, 10, 23, tzinfo=timezone.utc)
+        forecast = {
+            "location": "Jacovce",
+            "hourly": [
+                {
+                    "time": (start + timedelta(hours=hour)).isoformat(),
+                    "shortwave_radiation": 500 if hour == 12 else 0,
+                }
+                for hour in range(72)
+            ],
+        }
+
+        plan = optimize_day(
+            self.sample_status(40),
+            forecast,
+            7,
+            6,
+            25,
+            True,
+            now=datetime(2026, 10, 23, 6, 0, tzinfo=ZoneInfo(TIMEZONE)),
+        )
+
+        solar_by_utc_hour = {
+            datetime.fromisoformat(item["time"]).astimezone(timezone.utc).hour: item["solar_kwh"]
+            for item in plan["hourly_plan"]
+        }
+        self.assertAlmostEqual(solar_by_utc_hour[11], 0.5 * 7 * 0.8, places=3)
+        self.assertEqual(solar_by_utc_hour[12], 0)
+
     def test_cloudy_forecast_needs_more_grid_charge_than_sunny_forecast(self):
         now = datetime(2026, 10, 23, 10, tzinfo=ZoneInfo(TIMEZONE))
         cloudy = optimize_day(

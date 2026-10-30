@@ -25,6 +25,7 @@ import socketio
 
 from history import HistoryStore
 from continuous_optimizer import ContinuousOptimizationController
+from forecast_service import FORECAST_MODES, ForecastModelService, predict_hours
 from live_metrics import calculate_live_metrics
 from multi_window_scheduler import MultiWindowScheduler, compare_plan_with_telemetry
 from planner import SLOT_HOURS, BatteryModel, optimize_schedule
@@ -104,6 +105,7 @@ COMMAND_TIMEOUT = 60
 SOCKET_URL = "https://eu-socket.sofarcloud.com"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_RADIATION_LABEL_OFFSET = timedelta(hours=1)
 BATTERY_CHARGE_EFFICIENCY = 0.92
 BATTERY_DISCHARGE_EFFICIENCY = 0.95
 PV_SYSTEM_EFFICIENCY = 0.8
@@ -111,6 +113,7 @@ MINIMUM_BATTERY_SOC = 30
 MAXIMUM_BATTERY_SOC = 95
 BATTERY_WEAR_EUR_KWH = float(os.environ.get("SOFAR_BATTERY_WEAR_EUR_KWH", "0.01"))
 EXPORT_PRICE_EUR_KWH = float(os.environ.get("SOFAR_EXPORT_PRICE_EUR_KWH", "0"))
+FORECAST_MODEL_MODE = os.environ.get("SOFAR_FORECAST_MODEL_MODE", "active").strip().lower()
 PV_TILT_SETTING = os.environ.get("SOFAR_PV_TILT_DEG", "").strip()
 PV_TILT_DEG = float(PV_TILT_SETTING) if PV_TILT_SETTING else None
 PV_AZIMUTH_DEG = float(os.environ.get("SOFAR_PV_AZIMUTH_DEG", "0"))
@@ -140,6 +143,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LOGGER = logging.getLogger(__name__)
 HISTORY_STORE = None
 CONTINUOUS_OPTIMIZER = None
+FORECAST_SERVICE = None
 
 
 def record_history_event(history_store, event_type, summary, details=None):
@@ -306,7 +310,7 @@ def _open_meteo_json(url):
     return result
 
 
-def get_solar_forecast(location, tilt_deg=None, azimuth_deg=0):
+def geocode_location(location):
     if not isinstance(location, str) or not location.strip() or len(location) > 100:
         raise ValueError("Enter a location name up to 100 characters.")
     geocoding_query = urlencode(
@@ -339,12 +343,17 @@ def get_solar_forecast(location, tilt_deg=None, azimuth_deg=0):
         raise ForecastError("Open-Meteo returned invalid location coordinates.") from None
     if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
         raise ForecastError("Open-Meteo returned invalid location coordinates.")
+    return latitude, longitude, match
 
+
+def get_solar_forecast(location, tilt_deg=None, azimuth_deg=0):
+    latitude, longitude, match = geocode_location(location)
     variable = "shortwave_radiation" if tilt_deg is None else "global_tilted_irradiance"
+    extra_variables = ["temperature_2m"] if tilt_deg is None else ["shortwave_radiation", "temperature_2m"]
     forecast_params = {
         "latitude": latitude,
         "longitude": longitude,
-        "hourly": variable,
+        "hourly": ",".join([variable, *extra_variables]),
         "forecast_days": 3,
         "timezone": "GMT",
     }
@@ -358,8 +367,12 @@ def get_solar_forecast(location, tilt_deg=None, azimuth_deg=0):
     radiation = hourly.get(variable)
     if not isinstance(times, list) or not isinstance(radiation, list) or len(times) != len(radiation):
         raise ForecastError("Open-Meteo returned incomplete hourly solar data.")
+    def optional_series(name):
+        values = hourly.get(name)
+        return values if isinstance(values, list) and len(values) == len(times) else [None] * len(times)
+
     forecast = []
-    for hour, value in zip(times, radiation):
+    for hour, value, ghi, temperature in zip(times, radiation, optional_series("shortwave_radiation"), optional_series("temperature_2m")):
         try:
             irradiance = float(value)
             hour_time = datetime.fromisoformat(hour)
@@ -367,17 +380,21 @@ def get_solar_forecast(location, tilt_deg=None, azimuth_deg=0):
             raise ForecastError("Open-Meteo returned invalid hourly solar data.") from None
         if not math.isfinite(irradiance):
             raise ForecastError("Open-Meteo returned invalid hourly solar data.")
-        forecast.append(
-            {
-                "time": hour_time.replace(tzinfo=timezone.utc).isoformat(timespec="minutes"),
-                "shortwave_radiation": max(0, irradiance),
-            }
-        )
+        item = {
+            "time": hour_time.replace(tzinfo=timezone.utc).isoformat(timespec="minutes"),
+            "shortwave_radiation": max(0, irradiance),
+        }
+        for key, raw in (("ghi_wm2", ghi), ("temperature_c", temperature)):
+            if isinstance(raw, (int, float)) and math.isfinite(raw):
+                item[key] = max(0.0, float(raw)) if key == "ghi_wm2" else float(raw)
+        forecast.append(item)
     if not forecast:
         raise ForecastError("Open-Meteo returned an empty solar forecast.")
     return {
         "location": match.get("name") or location.strip(),
         "country": match.get("country") or "Slovensko",
+        "latitude": latitude,
+        "longitude": longitude,
         "hourly": forecast,
     }
 
@@ -629,6 +646,8 @@ def calculate_optimization(settings, client, history_store):
                 "SofarCloud historical consumption could not be downloaded; "
                 "the plan uses locally saved history or the seasonal fallback."
             )
+    if FORECAST_SERVICE is not None:
+        FORECAST_SERVICE.set_location(settings["location"])
     result = optimize_day(
         status,
         forecast,
@@ -638,6 +657,8 @@ def calculate_optimization(settings, client, history_store):
         settings["energy_aid"],
         history_store=history_store,
         planning_horizon_hours=settings["planning_horizon_hours"],
+        forecast_model=FORECAST_SERVICE.model() if FORECAST_SERVICE is not None else None,
+        forecast_mode=FORECAST_MODEL_MODE,
     )
     if history_sync_warning:
         result["consumption_history_sync_warning"] = history_sync_warning
@@ -711,6 +732,24 @@ def _terminal_value_eur_per_kwh(horizon_end_utc, energy_aid):
     return min(prices) * BATTERY_DISCHARGE_EFFICIENCY
 
 
+def _forecast_model_summary(mode, model, hours, error, used, display_tz):
+    summary = {"mode": mode, "used": used, "trained_at": model.get("trained_at") if model else None}
+    if error:
+        summary["error"] = error
+    elif mode != "off" and model is None:
+        summary["error"] = "No trained forecast model yet."
+    if hours:
+        summary["hourly"] = [
+            {
+                "time": hour.astimezone(display_tz).isoformat(timespec="minutes"),
+                "pv_kwh": round(values["pv_kwh"], 3),
+                "consumption_kwh": round(values["consumption_kwh"], 3),
+            }
+            for hour, values in sorted(hours.items())
+        ]
+    return summary
+
+
 def optimize_day(
     status,
     forecast,
@@ -721,6 +760,8 @@ def optimize_day(
     now=None,
     history_store=None,
     planning_horizon_hours=24,
+    forecast_model=None,
+    forecast_mode="off",
 ):
     """Compute charging windows across a rolling horizon in 15-minute slots."""
     
@@ -783,7 +824,7 @@ def optimize_day(
             hour = hour.replace(tzinfo=timezone.utc)
         else:
             hour = hour.astimezone(timezone.utc)
-        hour = hour.replace(minute=0, second=0, microsecond=0)
+        hour = hour.replace(minute=0, second=0, microsecond=0) - OPEN_METEO_RADIATION_LABEL_OFFSET
         if not math.isfinite(irradiance) or irradiance < 0:
             raise ForecastError("Hourly solar forecast contains invalid radiation values.")
         if hour_start_utc <= hour < horizon_end_utc:
@@ -835,6 +876,15 @@ def optimize_day(
         wear_eur_per_kwh=BATTERY_WEAR_EUR_KWH,
     )
     
+    model_hours = None
+    model_error = None
+    if forecast_mode in ("shadow", "active") and forecast_model is not None:
+        try:
+            model_hours = predict_hours(forecast_model, forecast, sorted(forecast_hours), TIMEZONE)
+        except (KeyError, TypeError, ValueError) as error:
+            model_error = str(error)
+    use_model = forecast_mode == "active" and model_hours is not None
+
     slots = []
     slot_start = start_utc
     while slot_start < horizon_end_utc:
@@ -848,6 +898,9 @@ def optimize_day(
             * daily_profile["scale"]
             * SLOT_HOURS
         )
+        if use_model:
+            solar_kwh = model_hours[hour_utc]["pv_kwh"] * SLOT_HOURS
+            consumption_kwh = model_hours[hour_utc]["consumption_kwh"] * SLOT_HOURS
         slots.append(
             {
                 "start": slot_start,
@@ -900,6 +953,9 @@ def optimize_day(
         "battery_wear_cost_eur": result["battery_wear_cost_eur"],
         "hourly_plan": result["hourly_plan"],
         "slot_plan": result["slot_plan"],
+        "forecast_model": _forecast_model_summary(
+            forecast_mode, forecast_model, model_hours, model_error, use_model, display_timezone
+        ),
         "consumption_estimate_source": consumption_estimate["source"],
         "consumption_history_days": consumption_estimate["sample_days"],
         "hourly_consumption_profile_source": hourly_consumption_estimate["source"],
@@ -2919,6 +2975,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 200,
                 {"hours": tariff_schedule(datetime.now(ZoneInfo(TIMEZONE)), 48)},
             )
+        elif self.path == "/api/forecast-model":
+            if FORECAST_SERVICE is None:
+                self._send_json(503, {"error": "Forecast model is not initialized."})
+            else:
+                self._send_json(200, FORECAST_SERVICE.state(FORECAST_MODEL_MODE))
         elif self.path == "/api/status":
             self._send_status()
         elif self.path == "/api/capabilities":
@@ -3398,8 +3459,19 @@ def main():
         )
     if bool(WEB_USERNAME) != bool(WEB_PASSWORD):
         raise SystemExit("Set both SOFAR_WEB_USERNAME and SOFAR_WEB_PASSWORD, or leave both empty.")
-    global HISTORY_STORE, TELEMETRY_SAMPLER, CONTINUOUS_OPTIMIZER
+    if FORECAST_MODEL_MODE not in FORECAST_MODES:
+        raise SystemExit("SOFAR_FORECAST_MODEL_MODE must be off, shadow or active.")
+    global HISTORY_STORE, TELEMETRY_SAMPLER, CONTINUOUS_OPTIMIZER, FORECAST_SERVICE
     HISTORY_STORE = HistoryStore(DATA_DIR / "history.sqlite3")
+    FORECAST_SERVICE = ForecastModelService(
+        DATA_DIR / "forecast_model.json",
+        CLIENT,
+        _open_meteo_json,
+        geocode_location,
+        TIMEZONE,
+        location=HISTORY_STORE.get_continuous_optimization_state()["settings"].get("location"),
+        logger=LOGGER,
+    )
     CLIENT.history_store = HISTORY_STORE
     SCHEDULED_CHARGE.history_store = HISTORY_STORE
     MULTI_WINDOW_SCHEDULER.history_store = HISTORY_STORE
@@ -3452,6 +3524,8 @@ def main():
     )
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), DashboardHandler)
     workers = (SCHEDULED_CHARGE, MULTI_WINDOW_SCHEDULER, TELEMETRY_SAMPLER, CONTINUOUS_OPTIMIZER)
+    if FORECAST_MODEL_MODE != "off":
+        workers += (FORECAST_SERVICE,)
     if READ_ONLY:
         workers = ()
         LOGGER.warning("Read-only mode: inverter commands and background controllers are disabled.")

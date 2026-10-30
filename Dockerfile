@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY run.py .
 COPY continuous_optimizer.py .
+COPY forecast_model.py .
+COPY forecast_service.py .
+COPY train_forecast.py .
 COPY history.py .
 COPY planner.py .
 COPY station_history.py .
